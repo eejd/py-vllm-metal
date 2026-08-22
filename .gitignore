@@ -141,7 +141,10 @@ cython_debug/
 Thumbs.db
 
 # Rust build artifacts
-Cargo.lock
+# Cargo.lock is committed on this branch: downstream packagers (MacPorts)
+# build offline from a source tarball and need the locked crate set to
+# vendor. The crate is a stub with one direct dependency (pyo3), so the
+# lock is 20 packages and near-zero maintenance.
 
 # Metal specific
 *.metallib
