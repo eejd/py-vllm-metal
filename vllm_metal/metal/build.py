@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import subprocess
+import os
 import sysconfig
 import tempfile
 from dataclasses import dataclass
@@ -215,10 +216,25 @@ def _find_package_path(name: str) -> Path:
     raise RuntimeError(f"Cannot locate package '{name}'")
 
 
-def _package_version(name: str) -> str:
+def _package_version(name: str, env_var: str | None = None) -> str:
+    """Version string of an installed package, for the build-input hash.
+
+    When the package is supplied by a system package manager rather than pip,
+    it may not be importable from this interpreter at build time (nanobind, for
+    instance, is often just vendored sources). `env_var` lets the caller pass
+    the version in explicitly; an unimportable package with no override hashes
+    as the empty string, which is safe -- it only makes the hash less specific.
+    """
     import importlib
 
-    mod = importlib.import_module(name)
+    if env_var:
+        override = os.environ.get(env_var, "").strip()
+        if override:
+            return override
+    try:
+        mod = importlib.import_module(name)
+    except ImportError:
+        return ""
     return str(getattr(mod, "__version__", ""))
 
 
@@ -233,15 +249,42 @@ class _BuildSpec:
     nb_version: str
 
 
+def _env_path(var: str) -> Path | None:
+    """Read a path override from the environment, if set and non-empty."""
+    raw = os.environ.get(var, "").strip()
+    return Path(raw) if raw else None
+
+
 def _build_spec() -> _BuildSpec:
-    """Resolve every input that affects the produced .so."""
+    """Resolve every input that affects the produced .so.
+
+    MLX and nanobind are normally located inside their installed Python
+    packages, which is how the wheels ship them. System package managers
+    (MacPorts, Homebrew, distro packages) instead install the MLX headers and
+    dylib into a shared prefix and the nanobind sources alongside them, so the
+    following environment variables override discovery:
+
+        VLLM_METAL_MLX_INCLUDE   directory containing mlx/ and metal_cpp/
+        VLLM_METAL_MLX_LIB       directory containing libmlx.dylib
+        VLLM_METAL_NANOBIND_SRC  path to nanobind's nb_combined.cpp
+        VLLM_METAL_NANOBIND_DIR  nanobind root (for include/ and ext/robin_map)
+
+    Each falls back to the in-package layout when unset, so the default build
+    is unchanged.
+    """
     py_include = sysconfig.get_paths()["include"]
-    nb_path = _find_package_path("nanobind")
-    mlx_path = _find_package_path("mlx")
-    mlx_include = mlx_path / "include"
-    mlx_lib = mlx_path / "lib"
+
+    nb_dir_override = _env_path("VLLM_METAL_NANOBIND_DIR")
+    nb_path = nb_dir_override or _find_package_path("nanobind")
+    nb_src = _env_path("VLLM_METAL_NANOBIND_SRC") or (nb_path / "src" / "nb_combined.cpp")
+
+    mlx_include_override = _env_path("VLLM_METAL_MLX_INCLUDE")
+    mlx_lib_override = _env_path("VLLM_METAL_MLX_LIB")
+    if mlx_include_override is None or mlx_lib_override is None:
+        mlx_path = _find_package_path("mlx")
+    mlx_include = mlx_include_override or (mlx_path / "include")
+    mlx_lib = mlx_lib_override or (mlx_path / "lib")
     metal_cpp = mlx_include / "metal_cpp"
-    nb_src = nb_path / "src" / "nb_combined.cpp"
 
     cmd = [
         "clang++",
@@ -299,8 +342,8 @@ def _build_spec() -> _BuildSpec:
         mlx_lib=mlx_lib,
         mlx_include=mlx_include,
         py_include=py_include,
-        mlx_version=_package_version("mlx.core"),
-        nb_version=_package_version("nanobind"),
+        mlx_version=_package_version("mlx.core", "VLLM_METAL_MLX_VERSION"),
+        nb_version=_package_version("nanobind", "VLLM_METAL_NANOBIND_VERSION"),
     )
 
 
