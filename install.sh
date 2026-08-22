@@ -70,6 +70,13 @@ install_vllm() {
   section "Installing vLLM core"
   echo "Wheel: vLLM ${VLLM_VERSION} (prebuilt macOS arm64)"
 
+  # The prebuilt wheel is cp312-cp312 (not abi3), so it only installs on 3.12.
+  if ! python -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)'; then
+    error "The prebuilt vLLM core wheel is cp312-only, but this venv is not Python 3.12."
+    echo "Either unset VLLM_METAL_PYTHON to use 3.12, or build vLLM core from source." >&2
+    exit 1
+  fi
+
   # The wheel's own metadata pulls torch et al. from PyPI.
   if ! uv pip install "$VLLM_WHEEL_URL"; then
     error "Failed to install vLLM core from ${VLLM_WHEEL_URL}"

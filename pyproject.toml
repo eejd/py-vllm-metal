@@ -9,7 +9,7 @@ version = "0.3.0"
 description = "vLLM hardware plugin for Apple Silicon - unifies MLX and PyTorch under a single lowering path"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.12,<3.15"
 authors = [
     {name = "vLLM Community"}
 ]
@@ -22,30 +22,35 @@ classifiers = [
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 dependencies = [
     # MLX - Required for Apple Silicon GPU acceleration.
-    # EXACT pin: the prebuilt _paged_ops.so links MLX private headers and
-    # subclasses mlx::core::Primitive (mlx/backend/metal/device.h, etc.), and
-    # libmlx.dylib carries no SONAME version (compatibility version 0.0.0), so
-    # a wheel built against one MLX is only ABI-safe against that exact MLX.
-    # Rebuild and re-release the wheel on every MLX bump.
-    "mlx==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Floor, not an exact pin. The ABI hazard is real but is a property of
+    # *prebuilt* wheels: _paged_ops.so links MLX private headers and subclasses
+    # mlx::core::Primitive (mlx/backend/metal/device.h, etc.), and libmlx.dylib
+    # carries no SONAME version (compatibility version 0.0.0), so a wheel built
+    # against one MLX is only ABI-safe against that exact MLX. When _paged_ops.so
+    # is compiled from source against the MLX actually present (see
+    # VLLM_METAL_BUILD_FROM_SOURCE), that mismatch cannot arise, and the
+    # hash-stamped .sha256 sidecars fail loudly if a stale artifact is reused.
+    # Anyone shipping a prebuilt wheel must still pin exactly at build time.
+    "mlx>=0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Git SHA (2026-08-05), not a version: architectures merged after the
     # 0.31.3 release (2026-04-22) never reach PyPI. main still self-reports
     # "0.31.3", so this looks like a no-op upgrade -- it is not.
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@254d153fdeb6f150edd4fc5a54f9828638481fa8 ; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
-    # Temporary cap: xgrammar's prebuilt wheels are compiled against a specific
-    # apache-tvm-ffi C++ ABI but declare only `apache-tvm-ffi>=0.1.9`, so a
-    # clean install resolves 0.1.13 and segfaults inside
-    # `xgrammar::__TVMFFIStaticInitFunc0()` before vLLM starts (#569).  We never
-    # import tvm-ffi; this bounds the resolver only.
-    # TODO: remove once xgrammar bounds its own apache-tvm-ffi range.
-    "apache-tvm-ffi>=0.1.9,<0.1.13; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Floor only. The <0.1.13 cap guarded xgrammar's *prebuilt* wheels, which are
+    # compiled against a specific apache-tvm-ffi C++ ABI while declaring only
+    # `apache-tvm-ffi>=0.1.9`; a clean install resolved 0.1.13 and segfaulted in
+    # `xgrammar::__TVMFFIStaticInitFunc0()` before vLLM started (#569). Building
+    # xgrammar from source against the tvm-ffi actually installed removes the
+    # mismatch. Restore the cap if you consume prebuilt xgrammar wheels.
+    "apache-tvm-ffi>=0.1.9; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # mlx-vlm 0.6.2 includes PaddleOCR-VL multi-image M-RoPE fixes.
     "mlx-vlm>=0.6.2,<0.7.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Model loading and weights
@@ -58,8 +63,10 @@ dependencies = [
     "transformers>=5.5.3,<5.13",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
-    # Native Metal extension JIT build
-    "nanobind==2.10.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Native Metal extension JIT build.
+    # Floor is 2.11.0: that release added Python 3.14 support. The previous
+    # ==2.10.2 pin is what capped this package below 3.14.
+    "nanobind>=2.11.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Core utilities
     "numpy>=1.24.0",
     "psutil>=5.9.0",
@@ -129,7 +136,7 @@ include = ["vllm_metal/metal/*.metallib", "vllm_metal/metal/_paged_ops*.so"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py314"
 exclude = ["extern", ".venv*", "test_vllm.py", "target"]
 
 [tool.ruff.lint]
@@ -137,7 +144,7 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
 ignore = ["E501", "UP040"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 warn_return_any = false
 warn_unused_configs = true
 ignore_missing_imports = true

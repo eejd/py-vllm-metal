@@ -51,11 +51,18 @@ ensure_uv() {
   fi
 }
 
+# Python version used for new virtual environments.
+# Default 3.12: install.sh's prebuilt vLLM core wheel is cp312-cp312 (not abi3),
+# so the wheel path only works on 3.12. Source builds of vLLM are not bound by
+# that -- vLLM itself declares requires-python >=3.10,<3.15 -- so override with
+# e.g. VLLM_METAL_PYTHON=3.14 when building vLLM core from source.
+VLLM_METAL_PYTHON="${VLLM_METAL_PYTHON:-3.12}"
+
 # Ensure virtual environment exists and is activated
 ensure_venv() {
   if [ ! -d "$1" ]; then
     section "Creating virtual environment"
-    uv venv "$1" --clear --python 3.12 --seed
+    uv venv "$1" --clear --python "$VLLM_METAL_PYTHON" --seed
   fi
 
   # shellcheck source=/dev/null
