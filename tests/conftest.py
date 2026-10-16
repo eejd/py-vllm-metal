@@ -88,6 +88,19 @@ def force_tiled_prefill():
 
 
 @pytest.fixture(autouse=True)
+def _restore_gloo_socket_ifname():
+    """MetalPlatform.check_and_update_config pins GLOO_SOCKET_IFNAME for local
+    serving; keep that process-wide side effect from leaking between tests."""
+
+    before = os.environ.get("GLOO_SOCKET_IFNAME")
+    yield
+    if before is None:
+        os.environ.pop("GLOO_SOCKET_IFNAME", None)
+    else:
+        os.environ["GLOO_SOCKET_IFNAME"] = before
+
+
+@pytest.fixture(autouse=True)
 def _seed_random_generators() -> None:
     """Seed common RNGs to keep tests deterministic."""
 

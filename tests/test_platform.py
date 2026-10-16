@@ -549,6 +549,117 @@ class TestMetalPlatform:
         ):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    def test_check_and_update_config_pins_gloo_to_loopback_for_local_serving(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-process serving must not wait on hostname-based gloo discovery."""
+        monkeypatch.delenv("GLOO_SOCKET_IFNAME", raising=False)
+
+        MetalPlatform.check_and_update_config(self._platform_config())
+
+        assert os.environ["GLOO_SOCKET_IFNAME"] == "lo0"
+
+    @pytest.mark.parametrize("explicit", ["en0", "utun4,en0", ""])
+    def test_check_and_update_config_keeps_explicit_gloo_interface(
+        self, monkeypatch: pytest.MonkeyPatch, explicit: str
+    ) -> None:
+        """Any value the operator set -- even an empty one -- is theirs to keep."""
+        monkeypatch.setenv("GLOO_SOCKET_IFNAME", explicit)
+
+        MetalPlatform.check_and_update_config(self._platform_config())
+
+        assert os.environ["GLOO_SOCKET_IFNAME"] == explicit
+
+    def test_pipeline_parallel_config_leaves_gloo_interface_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GLOO_SOCKET_IFNAME", raising=False)
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._platform_config(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="mp",
+                    pipeline_parallel_size=2,
+                    tensor_parallel_size=1,
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(
+                    kv_cache_dtype_skip_layers=[],
+                    block_size=None,
+                ),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
+                    is_hybrid=False,
+                    quantization=None,
+                ),
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=False,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.parallel_config.pipeline_parallel_size == 2
+            assert "GLOO_SOCKET_IFNAME" not in os.environ
+        finally:
+            reset_config()
+
+    def test_data_parallel_config_leaves_gloo_interface_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GLOO_SOCKET_IFNAME", raising=False)
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        # Admission under test is the topology, not Ray: skip the cluster hook.
+        monkeypatch.setattr(
+            MetalPlatform,
+            "_register_dp_ray_worker_setup_hook",
+            classmethod(lambda cls, ray_runtime_env: None),
+        )
+        reset_config()
+        try:
+            vllm_config = self._dp_vllm_config()
+
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            assert vllm_config.parallel_config.data_parallel_size == 2
+            assert "GLOO_SOCKET_IFNAME" not in os.environ
+        finally:
+            reset_config()
+
+    def test_rejected_tensor_parallel_config_leaves_gloo_interface_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GLOO_SOCKET_IFNAME", raising=False)
+        vllm_config = self._platform_config(
+            speculative_config=None,
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="uni",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=2,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+
+        with pytest.raises(NotImplementedError, match="tensor parallelism"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+        assert "GLOO_SOCKET_IFNAME" not in os.environ
+
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
         vllm_config = self._platform_config(

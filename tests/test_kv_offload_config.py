@@ -21,6 +21,17 @@ from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY  # noqa: E402
 _CONFIG_LOGGER = "vllm_metal.v1.kv_offload.config"
 
 
+@pytest.fixture(autouse=True)
+def _explicit_gloo_interface(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests assert the offload hook leaves os.environ untouched.
+
+    check_and_update_config also pins GLOO_SOCKET_IFNAME for local serving when
+    it is absent; an explicit value is kept as-is, so setting one here keeps the
+    assertions about the offload wiring only.
+    """
+    monkeypatch.setenv("GLOO_SOCKET_IFNAME", "lo0")
+
+
 def _base_config(**cache_overrides) -> SimpleNamespace:
     cache_config = SimpleNamespace(
         block_size=None,
