@@ -1079,6 +1079,22 @@ class MetalPlatform(Platform):
         # above; spawned engine workers inherit the environment).
         cls._default_mb_per_buffer(vllm_config)
 
+        # Single-node, single-process serving rendezvouses over gloo on this
+        # host. With no interface named, gloo resolves the machine hostname and
+        # can stall for tens of seconds (or pick a VPN tunnel) before the engine
+        # is usable. Pin the loopback interface (lo0 on macOS), but only for
+        # the one topology that never leaves the machine, and never override an
+        # explicit choice; multi-process and multi-node setups keep gloo's own
+        # interface selection. Runs in the API-server process before the engine
+        # child is created, so the child inherits it.
+        if (
+            parallel_config.tensor_parallel_size == 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+            and "GLOO_SOCKET_IFNAME" not in os.environ
+        ):
+            os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
+
         # Log memory configuration
         total_mem = cls.get_device_total_memory()
         available_mem = cls.get_device_available_memory()
