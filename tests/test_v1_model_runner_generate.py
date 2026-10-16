@@ -1210,6 +1210,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             start_pos=0,
             full_prompt_token_ids=None,
         )
+        # Admission precedes sampling: the final prefill advances this state.
+        runner._request_states["p0"] = mr.RequestState(
+            token_ids=[5, 6],
+            prompt_len=2,
+            sampling_params=SamplingParams(temperature=0.0),
+            block_ids=[[0]],
+        )
         batch = mr._ExecutionBatch()
         output_idx = batch.add_output("p0", [])
         batch.paged_prefill_entries = [
@@ -4264,6 +4271,14 @@ def test_intermediate_prefill_keeps_rng_and_drafter_bookkeeping(has_final_prefil
         generator=generator,
         block_ids=[[0]],
     )
+    if has_final_prefill:
+        # Admission precedes sampling: the final prefill advances this state.
+        runner._request_states["final"] = mr.RequestState(
+            token_ids=[3, 4],
+            prompt_len=2,
+            sampling_params=SamplingParams(temperature=0, logprobs=2),
+            block_ids=[[1]],
+        )
     boundaries = list(range(0, 2 * len(prefills) + 1, 2))
     runner._execute_model_state = mr._PagedForwardState(
         batch=batch,
