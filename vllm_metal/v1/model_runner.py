@@ -1667,12 +1667,12 @@ class MetalModelRunner:
         states_missing = False
         decode_req_ids: list[str] = []
         decode_params: list[SamplingParams] = []
-        for req_id in cached_reqs.req_ids:
+        for idx, req_id in enumerate(cached_reqs.req_ids):
             state = self._request_states.get(req_id)
             if state is None:
                 states_missing = True
                 break
-            if state.generated_tokens == 0:
+            if self._is_prompt_phase(state, cached_reqs.num_computed_tokens[idx]):
                 has_prefill_phase = True
                 continue
             if state.mrope_position_delta is not None:
@@ -1972,29 +1972,18 @@ class MetalModelRunner:
 
             batch.set_output(entry.output_idx, [next_token], logprobs)
             mm_delta = mm_prefill_deltas.get(prefill.req_id)
-            if entry.result_mode == "new_final":
-                prompt_len = prefill.prompt_len
-                assert prompt_len is not None
-                full_prompt = (
-                    prefill.full_prompt_token_ids
-                    if prefill.full_prompt_token_ids is not None
-                    else prefill.token_ids
-                )
-                self._request_states[prefill.req_id] = RequestState(
-                    token_ids=full_prompt + [next_token],
-                    prompt_len=prompt_len,
-                    sampling_params=prefill.sampling_params,
-                    pooling_params=prefill.pooling_params,
-                    generator=prefill.generator,
-                    generated_tokens=1,
-                    block_ids=prefill.block_ids,
-                    lora_id=prefill.lora_id,
-                    mrope_position_delta=mm_delta,
-                    num_computed_tokens=prefill.start_pos,
-                )
-                continue
-
+            # Final prefill advances the request's single admitted state. The
+            # computed boundary must land exactly on the known tokens, so a
+            # second advance (or one on an already-sampled state) is rejected
+            # instead of silently appending another token.
             req_state = self._request_states[prefill.req_id]
+            if prefill.start_pos + len(prefill.token_ids) != len(req_state.token_ids):
+                raise RuntimeError(
+                    f"Final prefill for request {prefill.req_id!r} ended at "
+                    f"{prefill.start_pos + len(prefill.token_ids)} but the "
+                    f"request holds {len(req_state.token_ids)} tokens; refusing "
+                    "to append a sampled token to a desynchronized state."
+                )
             req_state.token_ids.append(next_token)
             req_state.generated_tokens = len(req_state.token_ids) - req_state.prompt_len
             if mm_delta is not None:
@@ -2617,20 +2606,22 @@ class MetalModelRunner:
                 )
             )
 
-            # Intermediate chunks need RequestState immediately so a cached
-            # continuation in the next step can find the request.
-            if is_intermediate:
-                self._request_states[req_id] = RequestState(
-                    token_ids=list(token_ids),
-                    prompt_len=prompt_len,
-                    sampling_params=sampling_params,
-                    pooling_params=pooling_params,
-                    generator=generator,
-                    generated_tokens=0,
-                    block_ids=sched_block_ids,
-                    lora_id=lora_id,
-                    num_computed_tokens=computed_tokens,
-                )
+            # Admit the request's one RequestState now, before any forward
+            # or sample can run: the scheduler may issue the next cached
+            # step as soon as this step is scheduled, and every later
+            # transition (intermediate chunk, final-prefill sample, decode)
+            # advances this same object rather than creating another.
+            self._request_states[req_id] = RequestState(
+                token_ids=list(token_ids),
+                prompt_len=prompt_len,
+                sampling_params=sampling_params,
+                pooling_params=pooling_params,
+                generator=generator,
+                generated_tokens=0,
+                block_ids=sched_block_ids,
+                lora_id=lora_id,
+                num_computed_tokens=computed_tokens,
+            )
 
     def _update_pp_stage_states(self, scheduler_output: SchedulerOutput) -> None:
         """Maintain ``_request_states`` on a non-last pipeline stage.
@@ -2641,6 +2632,9 @@ class MetalModelRunner:
         updated later from cached scheduler metadata.
         """
         for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.req_id in self._request_states:
+                # Already admitted (with block ids) by _handle_new_requests.
+                continue
             token_ids = list(new_req.prompt_token_ids or [])
             self._request_states[new_req.req_id] = RequestState(
                 token_ids=token_ids,
@@ -2711,6 +2705,17 @@ class MetalModelRunner:
             state.generated_tokens = 0
             self._paged_request_seq_lens.pop(req_id, None)
 
+    @staticmethod
+    def _is_prompt_phase(state: RequestState, computed_tokens: int) -> bool:
+        """Whether a cached request still has prompt (or resume-recompute) work.
+
+        The scheduler's computed-token boundary decides, not the number of
+        generated tokens alone: a request whose boundary is still inside the
+        prompt continues prefill, and a resumed request (generated count reset
+        to zero) recomputes through every token it already knows.
+        """
+        return state.generated_tokens == 0 or computed_tokens < state.prompt_len
+
     def _collect_cached_requests(
         self,
         batch: _ExecutionBatch,
@@ -2723,12 +2728,29 @@ class MetalModelRunner:
 
         for idx, req_id in enumerate(cached_reqs.req_ids):
             state = self._request_states[req_id]
+            scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if scheduled_tokens <= 0:
+                # Metadata-only entry (block updates were applied already):
+                # nothing to forward, so enqueue no empty prefill or decode.
+                continue
 
-            if state.generated_tokens == 0:
-                computed_tokens = cached_reqs.num_computed_tokens[idx]
-                scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            computed_tokens = cached_reqs.num_computed_tokens[idx]
+            if self._is_prompt_phase(state, computed_tokens):
+                known_tokens = len(state.token_ids)
                 target_len = computed_tokens + scheduled_tokens
-                is_intermediate = target_len < len(state.token_ids)
+                if computed_tokens >= known_tokens or target_len > known_tokens:
+                    # The scheduler already counts a token this runner has not
+                    # materialized (its sampling step did not complete). Routing
+                    # it to decode would feed the last prompt token again.
+                    raise RuntimeError(
+                        f"Cached request {req_id!r} is scheduled for tokens "
+                        f"[{computed_tokens}, {target_len}) but the runner holds "
+                        f"{known_tokens} tokens (prompt_len={state.prompt_len}, "
+                        f"generated={state.generated_tokens}): the preceding "
+                        "sampling step did not materialize its token. This is a "
+                        "scheduler/runner state desync."
+                    )
+                is_intermediate = target_len < known_tokens
 
                 output_idx = batch.add_output(req_id, [])
 
@@ -2968,6 +2990,15 @@ class MetalModelRunner:
             )
         if self.model is None:
             raise RuntimeError("Model not loaded")
+        if self._execute_model_state is not None:
+            # sample_tokens() consumes the stashed forward. Starting another
+            # step first would overwrite it (and the cached decode would then
+            # run against tokens that were never sampled).
+            raise RuntimeError(
+                "execute_model() called while the previous paged forward has "
+                "not been consumed by sample_tokens(); execute/sample ordering "
+                "violated."
+            )
         if self._uses_encoder_pooling_backend():
             return self._run_encoder_pooling_batch(scheduler_output)
         if self._diffusion is not None:

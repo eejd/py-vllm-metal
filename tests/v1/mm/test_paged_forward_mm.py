@@ -835,6 +835,12 @@ class TestMmPrefillDeltaRoundTrip:
             start_pos=0,
             full_prompt=[99, 11],
         )
+        # Admission precedes sampling: the final prefill advances this state.
+        runner._request_states["req-0"] = RequestState(
+            token_ids=[99, 11],
+            prompt_len=2,
+            sampling_params=SamplingParams(temperature=0.0),
+        )
 
         # Use the runner's real ExecutionBatch path so the postprocess
         # iterates ``paged_prefill_entries``.
