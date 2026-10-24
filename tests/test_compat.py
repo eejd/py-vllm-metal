@@ -1134,14 +1134,31 @@ class TestGemma4AssistantProbe:
 
         assert compat._transformers_knows_gemma4_assistant(_Auto) is False
 
-    def test_default_config_validation_error_counts_as_known(self) -> None:
-        class _ValidationError(Exception):
-            """Stands in for huggingface_hub's StrictDataclassError (not a ValueError)."""
+    def test_strict_dataclass_error_counts_as_known(self) -> None:
+        errors = compat._strict_dataclass_errors()
+        if not errors:
+            pytest.skip("huggingface_hub has no StrictDataclassError")
 
         class _Auto:
             @staticmethod
             def for_model(_name: str):
-                raise _ValidationError("hidden_size_per_layer_input must be 0")
+                raise errors[0]("hidden_size_per_layer_input must be 0")
 
         assert compat._transformers_knows_gemma4_assistant(_Auto) is True
 
+    def test_import_error_is_not_swallowed(self) -> None:
+        class _Auto:
+            @staticmethod
+            def for_model(_name: str):
+                raise ImportError("No module named 'transformers.models.gemma4_assistant'")
+
+        with pytest.raises(ImportError):
+            compat._transformers_knows_gemma4_assistant(_Auto)
+
+    def test_real_autoconfig_probe_matches_the_mapping(self) -> None:
+        from transformers import AutoConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        assert compat._transformers_knows_gemma4_assistant(AutoConfig) == (
+            "gemma4_assistant" in CONFIG_MAPPING
+        )

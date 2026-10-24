@@ -292,14 +292,23 @@ def _transformers_knows_gemma4_assistant(auto_config: Any) -> bool:
     except ValueError:
         # ``for_model`` raises ValueError for a model type it does not know.
         return False
-    except Exception:
+    except _strict_dataclass_errors():
         # The type is registered but its default config does not construct:
         # transformers 5.20 raises huggingface_hub's StrictDataclassError (not
-        # a ValueError) from the gemma4_assistant default-config validation.
-        # Known type: do not register ours, and do not let the probe abort
-        # platform registration.
+        # a ValueError) from the gemma4_assistant default-config validation,
+        # while real configs load fine. Known type: our shim is not needed.
+        # Any other exception (e.g. ImportError) still propagates.
         return True
     return True
+
+
+def _strict_dataclass_errors() -> tuple[type[BaseException], ...]:
+    """huggingface_hub's strict-dataclass error, or () when this version lacks it."""
+    try:
+        from huggingface_hub.errors import StrictDataclassError
+    except ImportError:
+        return ()
+    return (StrictDataclassError,)
 
 
 def _patch_vllm_gemma4_mtp_config_loading() -> None:
