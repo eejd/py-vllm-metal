@@ -1123,3 +1123,25 @@ class TestQwen3FlatPrefixRealStrictLoad:
             assert not hasattr(pooling, "lm_head")
         finally:
             _unwrap_qwen3_sanitize(model_cls)
+
+
+class TestGemma4AssistantProbe:
+    def test_unknown_model_type_is_not_known(self) -> None:
+        class _Auto:
+            @staticmethod
+            def for_model(_name: str):
+                raise ValueError("Unrecognized model identifier")
+
+        assert compat._transformers_knows_gemma4_assistant(_Auto) is False
+
+    def test_default_config_validation_error_counts_as_known(self) -> None:
+        class _ValidationError(Exception):
+            """Stands in for huggingface_hub's StrictDataclassError (not a ValueError)."""
+
+        class _Auto:
+            @staticmethod
+            def for_model(_name: str):
+                raise _ValidationError("hidden_size_per_layer_input must be 0")
+
+        assert compat._transformers_knows_gemma4_assistant(_Auto) is True
+

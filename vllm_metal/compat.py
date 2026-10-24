@@ -290,7 +290,15 @@ def _transformers_knows_gemma4_assistant(auto_config: Any) -> bool:
     try:
         auto_config.for_model("gemma4_assistant")
     except ValueError:
+        # ``for_model`` raises ValueError for a model type it does not know.
         return False
+    except Exception:
+        # The type is registered but its default config does not construct:
+        # transformers 5.20 raises huggingface_hub's StrictDataclassError (not
+        # a ValueError) from the gemma4_assistant default-config validation.
+        # Known type: do not register ours, and do not let the probe abort
+        # platform registration.
+        return True
     return True
 
 
