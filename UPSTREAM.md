@@ -13,6 +13,7 @@ None. (Commits adopted from other repos would be listed here with `Source: <repo
 |---|---|---|
 | `topic/request-lifecycle` | none yet | not-submitted (found and soak-tested via macports-ports-local#1196; checked 2026-10-16 that upstream `main` @ `468b0c8` has no equivalent: the patch applies unchanged to `main` and to `v0.31.0`) |
 | `topic/gloo-loopback` | none yet | not-submitted (upstream #633 "Use loopback for default UniProc rendezvous" sets `VLLM_HOST_IP`, not `GLOO_SOCKET_IFNAME`; `main` only sets it in `tools/*.py`) |
+| `topic/gemma4-assistant-probe` | none yet | not-submitted (compat probe only catches ValueError; transformers 5.20 raises StrictDataclassError) |
 
 ## Origin
 
