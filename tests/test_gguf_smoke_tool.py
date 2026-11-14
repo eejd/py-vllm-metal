@@ -5,11 +5,12 @@ import json
 import sys
 import threading
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
 
 import pytest
 
+from tests.http_test_utils import LoopbackHTTPServer
 from tools import gguf_serve_smoke as smoke
 
 
@@ -38,7 +39,7 @@ def old_server():
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
     server.completion_requests = 0
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True

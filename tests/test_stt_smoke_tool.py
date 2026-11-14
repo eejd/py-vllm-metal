@@ -5,11 +5,12 @@ import json
 import sys
 import threading
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from types import SimpleNamespace
 
 import pytest
 
+from tests.http_test_utils import LoopbackHTTPServer
 from tools import stt_sampling_serve_smoke as smoke
 
 
@@ -30,7 +31,7 @@ def healthy_server():
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
     )

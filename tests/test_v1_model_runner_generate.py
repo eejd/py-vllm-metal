@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import torch
+from vllm.config import VllmConfig
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
@@ -31,6 +32,7 @@ from tests.stub_runner import (
     make_stub_runner,
 )
 from vllm_metal.attention.caches.state_cache import PagedStateCache
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.distributed.pipeline import PipelineGroup
@@ -39,6 +41,7 @@ from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.proposer import Gemma4MTPProposer
 from vllm_metal.v1.sampling_batch import _SamplingResult
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
+from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 
 class HybridRuntimeStub:
@@ -212,6 +215,23 @@ class TestV1MetalModelRunnerGenerate:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(tokenizer=object())
 
+    @pytest.fixture
+    def runner_config(self):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                logits_processors=None,
+                runner_type="generate",
+                logprobs_mode="raw_logprobs",
+                supports_multimodal_inputs=False,
+                seed=0,
+                is_diffusion=False,
+            ),
+            cache_config=SimpleNamespace(),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+            num_speculative_tokens=0,
+        )
+
     @pytest.mark.parametrize(
         ("configured_processors", "installed_processors"),
         [
@@ -247,25 +267,42 @@ class TestV1MetalModelRunnerGenerate:
         ["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"],
     )
     def test_init_passes_logprobs_mode_to_sampler(
-        self, monkeypatch: pytest.MonkeyPatch, logprobs_mode: str
+        self, monkeypatch: pytest.MonkeyPatch, runner_config, logprobs_mode: str
     ) -> None:
         # --logprobs-mode must reach the sample-logprobs path, not only prompt logprobs.
         monkeypatch.setattr(mr, "entry_points", lambda **_: (), raising=False)
-        vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                logits_processors=None,
-                runner_type="generate",
-                logprobs_mode=logprobs_mode,
-                supports_multimodal_inputs=False,
-            ),
-            cache_config=SimpleNamespace(),
-            scheduler_config=SimpleNamespace(async_scheduling=False),
-            speculative_config=None,
-        )
-
-        runner = mr.MetalModelRunner(vllm_config)
+        runner_config.model_config.logprobs_mode = logprobs_mode
+        runner = mr.MetalModelRunner(runner_config)
 
         assert runner._sampler.logprobs_mode == logprobs_mode
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_native_rng_retains_only_an_integer_counter(
+        self, monkeypatch: pytest.MonkeyPatch, runner_config, enabled: bool
+    ) -> None:
+        monkeypatch.setattr(mr, "entry_points", lambda **_: ())
+        monkeypatch.setenv("VLLM_METAL_NATIVE_SAMPLING", str(int(enabled)))
+        monkeypatch.setattr(
+            mx.random, "split", Mock(side_effect=AssertionError("No lazy key chain"))
+        )
+        runner = mr.MetalModelRunner(runner_config)
+        initial_state = vars(runner).copy()
+        assert not hasattr(runner, "_native_sample_key")
+        assert runner._native_sampling_enabled is enabled
+        assert type(runner._native_sampling_step) is int
+        assert runner._native_sampling_step == 0
+        assert not any(isinstance(value, mx.array) for value in initial_state.values())
+
+        if enabled:
+            # Leave keys unevaluated while advancing: only the integer may change.
+            keys = [runner._next_native_sample_key() for _ in range(4)]
+            assert vars(runner) == {**initial_state, "_native_sampling_step": 4}
+            mx.eval(*keys)
+            assert len({tuple(key.tolist()) for key in keys}) == 4
+        else:
+            with pytest.raises(RuntimeError, match="native sampling is disabled"):
+                runner._next_native_sample_key()
+            assert vars(runner) == initial_state
 
     def test_warm_up_propagates_dummy_forward_failure(self) -> None:
         runner = self._make_runner()
@@ -1209,13 +1246,6 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             start_pos=0,
             full_prompt_token_ids=None,
         )
-        # Admission precedes sampling: the final prefill advances this state.
-        runner._request_states["p0"] = mr.RequestState(
-            token_ids=[5, 6],
-            prompt_len=2,
-            sampling_params=SamplingParams(temperature=0.0),
-            block_ids=[[0]],
-        )
         batch = mr._ExecutionBatch()
         output_idx = batch.add_output("p0", [])
         batch.paged_prefill_entries = [
@@ -1370,7 +1400,9 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
         sampled_rows = []
 
-        def fake_sample_from_logits(logits_2d, batch, sampler):
+        def fake_sample_from_logits(
+            logits_2d, batch, sampler, *, next_native_rng_key=None
+        ):
             del sampler
             sampled_rows.append(logits_2d.tolist())
             assert [sp.temperature for sp in batch.sampling_params_list] == [0.7]
@@ -1383,6 +1415,137 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert output is not None
         assert output.sampled_token_ids == [[7, 9], [4]]
         assert sampled_rows == [[[0.0] * 4 + [10.0] + [0.0] * 11]]
+
+    def test_prompt_logprobs_decode_stays_native(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
+        runner = self._make_runner()
+        runner._native_sampling_enabled = True
+        runner._paged_attention_runtime = object()
+        state = self._make_state([1, 6])
+        state.sampling_params = SamplingParams(temperature=0.7, prompt_logprobs=0)
+        runner._request_states["r0"] = state
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 1}, {}, num_spec_tokens_to_schedule=0
+        )
+        scheduler_output.scheduled_cached_reqs.req_ids = ["r0"]
+
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        assert decision.eligible
+
+    @pytest.mark.parametrize(
+        "blocker",
+        [
+            "eligible",
+            "eligible_mixed",
+            "mixed_decode_fallback",
+            "mixed_prefill_fallback",
+            "speculative_config",
+            "drafter",
+            "grammar_output",
+            "structured_output",
+        ],
+    )
+    def test_sync_native_sampling_respects_runner_exclusions(self, blocker) -> None:
+        """Only native sub-batches consume a key, respecting runner exclusions."""
+        runner = self._make_runner()
+        runner._native_sampling_enabled = True
+        expected_steps = 1
+        runner._sampler = Mock(spec=Sampler)
+        runner._sampler.forward.side_effect = Sampler().forward
+        state = self._make_state([1, 6], temperature=0.7)
+        segment = mr.PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(6,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=1,
+            block_ids=((0,),),
+        )
+        scheduler_output = self._make_scheduler_output(
+            {"r0": 1}, {}, num_spec_tokens_to_schedule=0
+        )
+        scheduler_output.has_structured_output_requests = blocker == "structured_output"
+        grammar_output = None
+        if blocker == "speculative_config":
+            runner.vllm_config.speculative_config = SimpleNamespace(method="ngram")
+        elif blocker == "drafter":
+            runner._drafter = Mock()
+            runner._drafter.propose.return_value = None
+        elif blocker == "grammar_output":
+            grammar_output = self._make_grammar_output(["r0"], 4)
+        self._install_paged_state(
+            runner,
+            [("r0", state)],
+            (segment,),
+            self._make_logits([4]),
+            scheduler_output,
+        )
+        mixed = blocker in (
+            "eligible_mixed",
+            "mixed_decode_fallback",
+            "mixed_prefill_fallback",
+        )
+        if mixed:
+            state.sampling_params.top_k = 1
+            if blocker == "mixed_decode_fallback":
+                state.sampling_params.presence_penalty = 0.5
+            prefill = mr.PrefillRequest(
+                req_id="p0",
+                token_ids=[5],
+                sampling_params=SamplingParams(
+                    temperature=0.7,
+                    top_k=1,
+                    presence_penalty=(
+                        0.5 if blocker == "mixed_prefill_fallback" else 0.0
+                    ),
+                ),
+                block_ids=[[1]],
+                generator=None,
+                prompt_len=1,
+                start_pos=0,
+                full_prompt_token_ids=None,
+            )
+            scheduler_output.num_scheduled_tokens["p0"] = 1
+            scheduler_output.total_num_scheduled_tokens += 1
+            paged_state = runner._execute_model_state
+            output_idx = paged_state.batch.add_output("p0", [])
+            paged_state.batch.paged_prefill_entries = [
+                mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+            ]
+            runner._execute_model_state = paged_state._replace(
+                prefill_reqs=[prefill],
+                logits=self._make_logits([4, 7]),
+                cu_seqlens=[0, 1, 2],
+                logits_cu_seqlens=[0, 1, 2],
+            )
+            if blocker == "eligible_mixed":
+                expected_steps = 2
+
+        batch, _ = runner._sample_paged_batch(grammar_output)
+
+        assert len(state.token_ids) == 3
+        assert 0 <= state.token_ids[-1] < 16
+        if blocker in ("eligible", "eligible_mixed"):
+            runner._sampler.forward.assert_not_called()
+        else:
+            runner._sampler.forward.assert_called_once()
+        if blocker == "eligible" or mixed:
+            assert runner._native_sampling_step == expected_steps
+        else:
+            assert runner._native_sampling_step == 0
+        if mixed:
+            output = batch.to_model_runner_output()
+            assert output.req_ids == ["p0", "r0"]
+            assert output.sampled_token_ids == [[7], [4]]
+            assert state.token_ids == [1, 6, 4]
+            assert runner._request_states["p0"].token_ids == [5, 7]
+            if blocker != "eligible_mixed":
+                torch_logits = runner._sampler.forward.call_args.args[0]
+                assert torch_logits.argmax(dim=-1).tolist() == [
+                    4 if blocker == "mixed_decode_fallback" else 7
+                ]
 
     def test_structured_output_plain_spec_decode_request_is_allowed(self) -> None:
         runner = self._make_runner()
@@ -1480,6 +1643,8 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
 
     def test_structured_output_masks_same_request_spec_decode_rows(self) -> None:
         runner = self._make_runner()
+        # One speculative token: each structured request owns two bitmask rows.
+        runner._structured_output_applier = MetalStructuredOutputApplier(mask_stride=2)
         req_state = self._make_state([1, 6])
         decode_reqs = [("r0", req_state)]
         segment = mr.PagedDecodeSegment(
@@ -2234,6 +2399,10 @@ class TestRunnerMlaProperties:
         runner = self._make_runner({"kv_lora_rank": 512})
         assert runner.is_mla is True
 
+    def test_is_mla_false_when_kv_lora_rank_is_none(self) -> None:
+        runner = self._make_runner({"kv_lora_rank": None})
+        assert runner.is_mla is False
+
     def test_is_mla_false_for_standard_attention(self) -> None:
         runner = self._make_runner(
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
@@ -2476,8 +2645,7 @@ class TestStartPagedForwardSelectiveLogits:
 class TestMergeVerifyWindows:
     """merge_verify_windows derivation: the runtime decision behind which
     models keep spec-verify windows merged (window mode) vs expanded.
-    Window mode is opt-in, so the flag gates everything; with it set the
-    model-class exclusions still apply."""
+    Non-hybrid models opt in; their model-class exclusions still apply."""
 
     def test_false_by_default_without_opt_in(self) -> None:
         assert make_stub_runner().merge_verify_windows is False
@@ -2539,11 +2707,6 @@ class TestVerifyLayoutLog:
             ),
             (
                 "1",
-                {"is_hybrid": True},
-                "window mode does not support hybrid models",
-            ),
-            (
-                "1",
                 {
                     "model_config": SimpleNamespace(
                         runner_type="generate",
@@ -2554,7 +2717,7 @@ class TestVerifyLayoutLog:
                 "head size 512 exceeds the window mode's 256",
             ),
         ],
-        ids=["off", "mla", "hybrid", "head-size"],
+        ids=["off", "mla", "head-size"],
     )
     def test_expanded_layout_names_the_reason(
         self, monkeypatch, window_env, runner_kwargs, reason
@@ -2568,10 +2731,190 @@ class TestVerifyLayoutLog:
             in lines
         )
 
-    def test_no_line_without_speculative_decoding(self, monkeypatch) -> None:
-        lines = self._warm_up(monkeypatch, make_stub_runner(), speculative=False)
+    def test_hybrid_spec_forces_window_layout(self, monkeypatch) -> None:
+        # Hybrid verification needs per-request segments, so the window
+        # layout is forced regardless of the opt-in env.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0")
+        runner = make_stub_runner(
+            is_hybrid=True,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                2,
+                [1],
+                conv_kernel_dim=4,
+                conv_dim=64,
+                num_v_heads=1,
+                value_head_dim=64,
+                key_head_dim=64,
+            ),
+        )
+        lines = self._warm_up(monkeypatch, runner)
+        assert "Metal: spec-decode verify uses the window layout" in lines
+
+    def test_non_gdn_hybrid_spec_rejects_before_warm_up(self, monkeypatch) -> None:
+        # The forced window layout is a GDN-family capability: other hybrid
+        # state families have no span staging to recover per-request slots.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0")
+        runner = make_stub_runner(
+            is_hybrid=True,
+            hybrid_runtime_plan=make_nemotron_hybrid_plan("M*"),
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="window mode does not support non-GDN hybrid state families",
+        ):
+            self._warm_up(monkeypatch, runner)
+        runner._dummy_forward_outputs.assert_not_called()
+        runner._paged_attention_runtime.warm_up.assert_not_called()
+
+    @pytest.mark.parametrize("window_env", ["0", "1"])
+    @pytest.mark.parametrize(
+        ("config_head_size", "head_dims"),
+        [(512, []), (128, [128, 512])],
+        ids=["config-head-size", "per-layer-head-size"],
+    )
+    def test_hybrid_spec_rejects_unsupported_head_before_warm_up(
+        self, monkeypatch, window_env, config_head_size, head_dims
+    ) -> None:
+        # Expanded rows lose the per-request state mapping; the head bound
+        # must reject the configuration before any warm-up forward runs.
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", window_env)
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(
+                runner_type="generate",
+                get_head_size=lambda: config_head_size,
+                is_hybrid=True,
+            ),
+            head_dim_per_layer=head_dims,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                2,
+                [1],
+                conv_kernel_dim=4,
+                conv_dim=64,
+                num_v_heads=1,
+                value_head_dim=64,
+                key_head_dim=64,
+            ),
+        )
+        with pytest.raises(
+            NotImplementedError, match="head size 512 exceeds the window mode's 256"
+        ):
+            self._warm_up(monkeypatch, runner)
+        runner._dummy_forward_outputs.assert_not_called()
+        runner._paged_attention_runtime.warm_up.assert_not_called()
+        with pytest.raises(NotImplementedError, match="requires the GDN window layout"):
+            _ = runner.merge_verify_windows
+
+    @pytest.mark.parametrize("is_hybrid", [False, True])
+    def test_no_line_without_speculative_decoding(self, monkeypatch, is_hybrid) -> None:
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(
+                runner_type="generate", get_head_size=lambda: 512, is_hybrid=is_hybrid
+            ),
+        )
+        lines = self._warm_up(monkeypatch, runner, speculative=False)
 
         assert not any("spec-decode verify" in line for line in lines)
+        runner._dummy_forward_outputs.assert_called_once()
+        runner._paged_attention_runtime.warm_up.assert_called_once()
+
+
+class TestHybridDraftCaps:
+    """``_hybrid_draft_caps`` keeps every verify span inside the state block
+    that starts it, so align-mode checkpoints stay exact by construction."""
+
+    _STRIDE = 16
+
+    def _runner(self, checkpoint_stride: int | None):
+        runner = make_stub_runner()
+        runtime = HybridPagedAttentionRuntime.__new__(HybridPagedAttentionRuntime)
+        runtime._state_manager = SimpleNamespace(checkpoint_stride=checkpoint_stride)
+        runner._paged_attention_runtime = runtime
+        return runner
+
+    @staticmethod
+    def _segment(req_id: str, cache_start_pos: int) -> mr.PagedDecodeSegment:
+        return mr.PagedDecodeSegment(
+            req_id=req_id,
+            input_token_ids=(0,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=cache_start_pos,
+            block_ids=((0,),),
+        )
+
+    @staticmethod
+    def _prefill(req_id: str, start_pos: int, num_tokens: int) -> mr.PrefillRequest:
+        return mr.PrefillRequest(
+            req_id=req_id,
+            token_ids=[0] * num_tokens,
+            sampling_params=SamplingParams(temperature=0.0),
+            block_ids=[[0]],
+            generator=None,
+            prompt_len=start_pos + num_tokens,
+            start_pos=start_pos,
+            full_prompt_token_ids=None,
+        )
+
+    def test_decode_cap_anchors_at_next_span_start(self) -> None:
+        runner = self._runner(self._STRIDE)
+        caps = runner._hybrid_draft_caps(
+            [
+                self._segment("mid", 6),  # next span starts at 6 + 2 = 8
+                self._segment("last-row", 14),  # next span starts at 15
+                self._segment("block-start", 15),  # next span starts at 16
+            ],
+            [[1, 2], [1], [1]],
+            [],
+        )
+        assert caps == {
+            "mid": 7,  # rows 8..15 stay in block 0
+            "last-row": 0,  # row 15 fills block 0; drafts would cross
+            "block-start": 15,  # rows 16..30 fill block 1 exactly
+        }
+
+    def test_prefill_cap_anchors_one_past_the_prompt(self) -> None:
+        # The first post-prefill verify span starts at start_pos + len(tokens)
+        # (the sampled token's position), not at the prompt's last row.
+        runner = self._runner(self._STRIDE)
+        caps = runner._hybrid_draft_caps(
+            [],
+            [],
+            [
+                self._prefill("mid-block", 0, 29),  # span starts at 29
+                self._prefill("aligned", 0, 32),  # span starts at 32
+                self._prefill("block-end", 0, 31),  # span starts at 31
+            ],
+        )
+        assert caps == {
+            "mid-block": 2,  # rows 29..31 stay in block 1; 3 would cross
+            "aligned": 15,  # rows 32..46 fill block 2 exactly
+            "block-end": 0,  # row 31 fills block 1; drafts would cross
+        }
+
+    def test_mixed_decode_and_prefill_caps(self) -> None:
+        runner = self._runner(self._STRIDE)
+        caps = runner._hybrid_draft_caps(
+            [self._segment("d0", 6)],
+            [[1, 2]],
+            [self._prefill("p0", 0, 29)],
+        )
+        assert caps == {"d0": 7, "p0": 2}
+
+    def test_no_caps_without_align_checkpoints(self) -> None:
+        # Per-request state mode has no checkpoints to protect.
+        runner = self._runner(None)
+        assert (
+            runner._hybrid_draft_caps(
+                [self._segment("d0", 6)], [[1, 2]], [self._prefill("p0", 0, 29)]
+            )
+            is None
+        )
+
+    def test_no_caps_for_non_hybrid_runtime(self) -> None:
+        runner = make_stub_runner()
+        runner._paged_attention_runtime = SimpleNamespace()
+        assert runner._hybrid_draft_caps([self._segment("d0", 6)], [[1]], []) is None
 
 
 class TestLoadModelPipelineSplitOrdering:
@@ -3037,11 +3380,11 @@ class TestPipelineGateSpecDecodeDerivation:
         }
         return self._cached_decode_output("r0")
 
-    def test_native_random_decode_step_eligible_with_live_key(self) -> None:
+    def test_native_random_decode_step_eligible_when_enabled(self) -> None:
         # Arrange — a plain temperature/top-k/top-p decode step with the
-        # native sampling key chain live must defer like a greedy step.
+        # native sampling capability enabled must defer like a greedy step.
         runner = self._runner(drafter=None)
-        runner._native_sample_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
         scheduler_output = self._native_random_decode_setup(runner)
 
         # Act
@@ -3051,17 +3394,67 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is True
         assert decision.reason == "eligible"
 
-    def test_native_random_decode_step_blocked_without_key(self) -> None:
+    def test_native_random_decode_step_blocked_when_disabled(self) -> None:
         # Arrange — same step shape with native sampling disabled keeps the
         # synchronous torch path.
         runner = self._runner(drafter=None)
-        runner._native_sample_key = None
+        runner._native_sampling_enabled = False
         scheduler_output = self._native_random_decode_setup(runner)
 
         # Act
         decision = runner._evaluate_pipeline_gate(scheduler_output)
 
         # Assert
+        assert decision.eligible is False
+        assert decision.reason == "non-native sampling"
+
+    @pytest.mark.parametrize(
+        ("token_ids", "expected_eligible", "expected_reason"),
+        [
+            ([1, 7], False, "non-native sampling"),
+            ([1, 7, 8], True, "eligible"),
+        ],
+        ids=["min-tokens-pending", "min-tokens-reached"],
+    )
+    def test_min_tokens_blocks_pipeline_only_until_reached(
+        self,
+        token_ids: list[int],
+        expected_eligible: bool,
+        expected_reason: str,
+    ) -> None:
+        # Stop tokens stay masked on the torch sampler until the request
+        # has generated min_tokens outputs.
+        runner = self._runner(drafter=None)
+        runner._request_states = {
+            "r0": mr.RequestState(
+                token_ids=token_ids,
+                prompt_len=1,
+                sampling_params=SamplingParams(temperature=0.0, min_tokens=2),
+                generator=None,
+                generated_tokens=len(token_ids) - 1,
+            )
+        }
+        scheduler_output = self._cached_decode_output("r0")
+
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+
+        assert decision.eligible is expected_eligible
+        assert decision.reason == expected_reason
+
+    def test_logit_bias_blocks_pipeline(self) -> None:
+        runner = self._runner(drafter=None)
+        runner._request_states = {
+            "r0": mr.RequestState(
+                token_ids=[1, 7],
+                prompt_len=1,
+                sampling_params=SamplingParams(temperature=0.0, logit_bias={1: 5.0}),
+                generator=None,
+                generated_tokens=1,
+            )
+        }
+
+        decision = runner._evaluate_pipeline_gate(self._cached_decode_output("r0"))
+
         assert decision.eligible is False
         assert decision.reason == "non-native sampling"
 
@@ -3231,36 +3624,201 @@ class TestDeferredDecodeSampleThreading:
             generated_tokens=1,
         )
 
+    def test_sync_and_deferred_native_sampling_share_counter(self) -> None:
+        """Sync/deferred transitions preserve RNG consumption and token ownership."""
+        runner = make_stub_runner(model_args={"vocab_size": 4})
+        runner._native_sampling_enabled = True
+        expected_steps = 0
+        runner._sampler = Mock(spec=Sampler)
+        runner._sampler.forward.side_effect = Sampler().forward
+
+        # 1. Synchronous prefill advances the native sampling counter.
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=False, reason="prefill-phase requests")
+        )
+        prefill = mr.PrefillRequest(
+            req_id="r0",
+            token_ids=[3],
+            sampling_params=SamplingParams(temperature=0.7, top_k=1),
+            block_ids=[[1]],
+            generator=None,
+            prompt_len=1,
+            start_pos=0,
+            full_prompt_token_ids=None,
+        )
+        paged_state = self._paged_state(runner, [], prefill_reqs=[prefill])
+        output_idx = paged_state.batch.add_output("r0", [])
+        paged_state.batch.paged_prefill_entries = [
+            mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+        ]
+        paged_state.scheduler_output.num_scheduled_tokens["r0"] = 1
+        paged_state.scheduler_output.total_num_scheduled_tokens = 1
+        runner._execute_model_state = paged_state._replace(
+            logits=mx.array([[[0.0, 0.0, 10.0, 0.0]]]),
+            cu_seqlens=[0, 1],
+            logits_cu_seqlens=[0, 1],
+        )
+        result = runner.sample_tokens(grammar_output=None)
+
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
+        runner._sampler.forward.assert_not_called()
+        assert result.req_ids == ["r0"]
+        assert result.sampled_token_ids == [[2]]
+        state = runner._request_states["r0"]
+        assert state.token_ids == [3, 2]
+
+        # 2. Leave the deferred output pending until the mixed step's barrier.
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        deferred_output = runner.sample_tokens(grammar_output=None)
+
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
+        assert isinstance(deferred_output, mr.MetalAsyncModelRunnerOutput)
+        assert state.token_ids == [3, 2, mr.PENDING_TOKEN_PLACEHOLDER]
+        assert runner._decode_pipeline.has_pending
+        runner._sampler.forward.assert_not_called()
+
+        # 3. execute_model calls begin_step before building the mixed forward.
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=False, reason="prefill-phase requests")
+        )
+        assert not runner._decode_pipeline.has_pending
+        assert state.token_ids == [3, 2, 1]
+        assert runner._native_sampling_step == expected_steps
+
+        prefill = prefill._replace(
+            req_id="p0",
+            sampling_params=SamplingParams(
+                temperature=0.7, top_k=1, presence_penalty=0.5
+            ),
+        )
+        decode_reqs = [("r0", state)]
+        paged_state = self._paged_state(runner, decode_reqs, prefill_reqs=[prefill])
+        paged_state.batch.paged_decode_reqs = decode_reqs
+        output_idx = paged_state.batch.add_output("p0", [])
+        paged_state.batch.paged_prefill_entries = [
+            mr._PendingPrefillEntry(output_idx, prefill, "new_final")
+        ]
+        paged_state.scheduler_output.num_scheduled_tokens["p0"] = 1
+        paged_state.scheduler_output.total_num_scheduled_tokens = 2
+        runner._execute_model_state = paged_state._replace(
+            logits=mx.array([[[0.0, 10.0, 0.0, 0.0], [0.0, 0.0, 10.0, 0.0]]]),
+            cu_seqlens=[0, 1, 2],
+            logits_cu_seqlens=[0, 1, 2],
+            decode_segments=(
+                mr.PagedDecodeSegment(
+                    req_id="r0",
+                    input_token_ids=(state.token_ids[-1],),
+                    start_row=0,
+                    num_query_tokens=1,
+                    draft_token_ids=(),
+                    cache_start_pos=len(state.token_ids) - 1,
+                    block_ids=((1,),),
+                ),
+            ),
+        )
+        result = runner.sample_tokens(grammar_output=None)
+
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
+        runner._sampler.forward.assert_called_once()
+        assert result.req_ids == ["p0", "r0"]
+        assert result.sampled_token_ids == [[2], [1]]
+        assert runner._request_states["p0"].token_ids == [3, 2]
+        assert state.token_ids == [3, 2, 1, 1]
+
+        # Consume the cached result before the next deferred submission.
+        result = deferred_output.get_output()
+        assert result.req_ids == ["r0"]
+        assert result.sampled_token_ids == [[1]]
+        assert state.token_ids == [3, 2, 1, 1]
+        assert runner._native_sampling_step == expected_steps
+
+        # 4. Deferred decode continues the same counter after the mixed step.
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+        runner._execute_model_state = self._paged_state(runner, [("r0", state)])
+        output = runner.sample_tokens(grammar_output=None)
+
+        expected_steps += 1
+        assert runner._native_sampling_step == expected_steps
+        assert isinstance(output, mr.MetalAsyncModelRunnerOutput)
+        assert state.token_ids == [3, 2, 1, 1, mr.PENDING_TOKEN_PLACEHOLDER]
+        result = output.get_output()
+        assert result.req_ids == ["r0"]
+        assert result.sampled_token_ids == [[1]]
+        assert state.token_ids == [3, 2, 1, 1, 1]
+        assert runner._native_sampling_step == expected_steps
+        runner._sampler.forward.assert_called_once()
+
     def test_deferred_random_step_samples_natively_and_backfills(self) -> None:
         # Arrange — top_k=1 pins the categorical draw to the argmax row, so
         # the backfilled value is deterministic while still exercising the
         # native random graph.
         runner = make_stub_runner(model_args={"vocab_size": 4})
-        runner._native_sample_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
         state = self._random_decode_state()
         runner._paged_request_seq_lens = {"r0": 1}
         runner._execute_model_state = self._paged_state(runner, [("r0", state)])
         runner._decode_pipeline.begin_step(
             mr.PipelineGateDecision(eligible=True, reason="eligible")
         )
-        initial_key = runner._native_sample_key
 
         # Act — through the public seam the engine calls.
         output = runner.sample_tokens(grammar_output=None)
         result = output.get_output()
 
-        # Assert — the key chain advanced exactly once, the async backfill
+        # Assert — the counter advanced exactly once, the async backfill
         # resolved the placeholder, and top_k=1 pins the sampled value.
         assert isinstance(output, mr.MetalAsyncModelRunnerOutput)
-        assert runner._native_sample_key.tolist() != initial_key.tolist()
+        assert runner._native_sampling_step == 1
         assert state.token_ids[-1] == 1
         assert result.sampled_token_ids == [[1]]
+
+    def test_deferred_random_samples_match_synchronous_seed_and_step(self) -> None:
+        """Deferring evaluation must preserve draws from the shared counter."""
+        streams = []
+        for deferred in (False, True):
+            runner = make_stub_runner(
+                model_args={"vocab_size": 512},
+                _native_sampling_enabled=True,
+                _native_sampling_step=11,
+            )
+            state = self._random_decode_state()
+            state.sampling_params = SamplingParams(temperature=0.8)
+            runner._paged_request_seq_lens = {"r0": 1}
+            tokens = []
+            for step in range(8):
+                runner._decode_pipeline.begin_step(
+                    mr.PipelineGateDecision(eligible=deferred, reason="test")
+                )
+                paged_state = self._paged_state(runner, [("r0", state)])._replace(
+                    logits=mx.zeros((1, 1, 512))
+                )
+                paged_state.batch.paged_decode_reqs = paged_state.decode_reqs
+                runner._execute_model_state = paged_state
+                output = runner.sample_tokens(grammar_output=None)
+                assert runner._native_sampling_step == 12 + step
+                if deferred:
+                    output = output.get_output()
+                assert runner._native_sampling_step == 12 + step
+                tokens.extend(output.sampled_token_ids[0])
+                assert state.token_ids[-1] == tokens[-1]
+            streams.append(tokens)
+
+        assert streams[0] == streams[1]
+        assert len(set(streams[0])) > 1
 
     def test_deferred_random_step_never_samples_padded_vocab(self) -> None:
         """Columns past the model vocab must be unreachable even when a
         padded column holds the largest logit."""
         runner = make_stub_runner(model_args={"vocab_size": 4})
-        runner._native_sample_key = mx.random.key(0)
+        runner._native_sampling_enabled = True
         state = self._random_decode_state()
         runner._paged_request_seq_lens = {"r0": 1}
         paged_state = self._paged_state(runner, [("r0", state)])._replace(
@@ -3277,10 +3835,10 @@ class TestDeferredDecodeSampleThreading:
         assert result.sampled_token_ids == [[1]]
 
     def test_deferred_ineligible_batch_raises_gate_desync(self) -> None:
-        # Arrange — a non-greedy batch with no live native sampling key must
+        # Arrange — a non-greedy batch with native sampling disabled must
         # fail fast instead of silently sampling with the wrong semantics.
         runner = make_stub_runner()
-        runner._native_sample_key = None
+        runner._native_sampling_enabled = False
         state = self._random_decode_state()
         runner._paged_request_seq_lens = {"r0": 1}
         runner._execute_model_state = self._paged_state(runner, [("r0", state)])
@@ -4096,14 +4654,6 @@ def test_intermediate_prefill_keeps_rng_and_drafter_bookkeeping(has_final_prefil
         generator=generator,
         block_ids=[[0]],
     )
-    if has_final_prefill:
-        # Admission precedes sampling: the final prefill advances this state.
-        runner._request_states["final"] = mr.RequestState(
-            token_ids=[3, 4],
-            prompt_len=2,
-            sampling_params=SamplingParams(temperature=0, logprobs=2),
-            block_ids=[[1]],
-        )
     boundaries = list(range(0, 2 * len(prefills) + 1, 2))
     runner._execute_model_state = mr._PagedForwardState(
         batch=batch,
@@ -4219,7 +4769,7 @@ class TestStateBlockIdLifecycle:
                 req_ids=["r"],
                 resumed_req_ids={"r"},
                 new_token_ids=[],
-                all_token_ids={},
+                all_token_ids={"r": [1]},
                 new_block_ids=[([50], [60], [70], [80])],
                 num_computed_tokens=[0],
                 num_output_tokens=[0],
@@ -4228,3 +4778,197 @@ class TestStateBlockIdLifecycle:
 
         assert runner._state_block_ids_by_req["r"] == [[50], [60], [70]]
         assert runner._request_states["r"].block_ids == [[80]]
+
+
+class TestPreemptedReadmission:
+    """Preempted requests resume through the V1 and V2 scheduler contracts."""
+
+    def _new_req(
+        self,
+        prefill_token_ids: list[int],
+        *,
+        num_computed_tokens: int,
+        sampling_params: SamplingParams | None = None,
+    ) -> NewRequestData:
+        return NewRequestData(
+            req_id="r",
+            prompt_token_ids=prefill_token_ids[:4],
+            mm_features=[],
+            sampling_params=sampling_params or SamplingParams(),
+            pooling_params=None,
+            block_ids=([10, 11],),
+            num_computed_tokens=num_computed_tokens,
+            lora_request=None,
+            prefill_token_ids=prefill_token_ids,
+        )
+
+    def _scheduler_output(
+        self,
+        new_req: NewRequestData | None,
+        num_scheduled_tokens: int,
+        *,
+        preempted_req_ids: set[str] | None = None,
+        cached_reqs: CachedRequestData | None = None,
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
+            scheduled_new_reqs=[new_req] if new_req else [],
+            scheduled_cached_reqs=cached_reqs or CachedRequestData.make_empty(),
+            num_scheduled_tokens=(
+                {"r": num_scheduled_tokens} if num_scheduled_tokens else {}
+            ),
+            total_num_scheduled_tokens=num_scheduled_tokens,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            preempted_req_ids=preempted_req_ids or set(),
+            has_structured_output_requests=False,
+        )
+
+    def _admit(
+        self, runner: mr.MetalModelRunner, new_req: NewRequestData, num_scheduled: int
+    ) -> mr._PendingPrefillEntry:
+        batch = mr._ExecutionBatch()
+        runner._handle_new_requests(
+            batch, [new_req], self._scheduler_output(new_req, num_scheduled)
+        )
+        return batch.paged_prefill_entries[0]
+
+    def _preempted_runner(
+        self, generator: torch.Generator | None = None
+    ) -> mr.MetalModelRunner:
+        runner = make_stub_runner()
+        runner._request_states["r"] = mr.RequestState(
+            token_ids=[1, 2, 3, 4, 5, 6, 99],
+            prompt_len=4,
+            sampling_params=SamplingParams(),
+            generator=generator,
+            generated_tokens=3,
+        )
+        return runner
+
+    def test_readmission_continues_from_prefill_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        generator = torch.Generator().manual_seed(0)
+        runner = self._preempted_runner(generator)
+        runner.vllm_config = VllmConfig()
+        assert runner.vllm_config.use_v2_model_runner
+        runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
+        forward = Mock()
+        monkeypatch.setattr(runner, "_start_paged_forward", forward)
+        new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
+
+        runner.execute_model(self._scheduler_output(None, 0, preempted_req_ids={"r"}))
+        forward.assert_not_called()
+        runner.execute_model(self._scheduler_output(new_req, 1))
+        forward.assert_called_once()
+        entry = forward.call_args.args[0].paged_prefill_entries[0]
+
+        state = runner._request_states["r"]
+        assert entry.prefill.token_ids == [6]
+        assert entry.prefill.start_pos == 5
+        assert entry.prefill.generator is generator
+        assert entry.result_mode == "cached_final"
+        assert state.token_ids == [1, 2, 3, 4, 5, 6]
+        assert state.prompt_len == 4
+
+    def test_v1_readmission_continues_from_cached_tokens(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+        generator = torch.Generator().manual_seed(0)
+        runner = self._preempted_runner(generator)
+        runner.vllm_config = VllmConfig()
+        assert not runner.vllm_config.use_v2_model_runner
+        runner._paged_attention_runtime = Mock(spec=SDPAPagedAttentionRuntime)
+        forward = Mock()
+        monkeypatch.setattr(runner, "_start_paged_forward", forward)
+        cached_reqs = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids={"r"},
+            all_token_ids={"r": [1, 2, 3, 4, 5, 6]},
+            new_block_ids=[([10, 11],)],
+            num_computed_tokens=[5],
+            num_output_tokens=[2],
+            new_token_ids=[],
+        )
+
+        runner.execute_model(self._scheduler_output(None, 0, preempted_req_ids={"r"}))
+        forward.assert_not_called()
+        runner.execute_model(self._scheduler_output(None, 1, cached_reqs=cached_reqs))
+        forward.assert_called_once()
+        entry = forward.call_args.args[0].paged_prefill_entries[0]
+
+        state = runner._request_states["r"]
+        assert state.token_ids == [1, 2, 3, 4, 5, 6]
+        assert state.prompt_len == 4
+        assert state.generator is generator
+        assert entry.prefill.token_ids == [6]
+        assert entry.prefill.start_pos == 5
+        assert entry.prefill.generator is generator
+        assert entry.result_mode == "cached_final"
+
+    @pytest.mark.parametrize(
+        ("prefill_token_ids", "owes_prompt_logprobs"),
+        [([1, 2, 3, 4], True), ([1, 2, 3, 4, 5], False)],
+    )
+    def test_readmission_owes_prompt_logprobs_only_without_output(
+        self, prefill_token_ids: list[int], owes_prompt_logprobs: bool
+    ) -> None:
+        runner = self._preempted_runner()
+        new_req = self._new_req(
+            prefill_token_ids,
+            num_computed_tokens=0,
+            sampling_params=SamplingParams(prompt_logprobs=1),
+        )
+
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
+        self._admit(runner, new_req, len(prefill_token_ids))
+
+        assert runner._prompt_logprobs_tracker.wants("r") is owes_prompt_logprobs
+
+    def test_finished_id_reentering_in_the_same_step_is_admitted_fresh(
+        self,
+    ) -> None:
+        runner = self._preempted_runner()
+        new_req = self._new_req([7, 8, 9, 10], num_computed_tokens=0)
+
+        runner._reconcile_request_lifecycle({"r"}, preempted_req_ids={"r"})
+        entry = self._admit(runner, new_req, 4)
+
+        assert entry.prefill.token_ids == [7, 8, 9, 10]
+        assert entry.prefill.prompt_len == 4
+        assert entry.result_mode == "new_final"
+
+    def test_v1_resumed_id_reentering_later_is_admitted_fresh(self) -> None:
+        runner = self._preempted_runner()
+        new_req = NewRequestData(
+            req_id="r",
+            prompt_token_ids=[7, 8, 9, 10],
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+            block_ids=([10, 11],),
+            num_computed_tokens=0,
+            lora_request=None,
+        )
+
+        runner._reconcile_request_lifecycle(set(), preempted_req_ids={"r"})
+        runner._reconcile_request_lifecycle(set(), resumed_req_ids={"r"})
+        entry = self._admit(runner, new_req, 4)
+
+        assert entry.prefill.token_ids == [7, 8, 9, 10]
+        assert entry.result_mode == "new_final"
+
+    def test_non_last_pp_stage_keeps_the_prefill_tokens(self) -> None:
+        runner = make_stub_runner()
+        new_req = self._new_req([1, 2, 3, 4, 5, 6], num_computed_tokens=5)
+
+        runner._update_pp_stage_states(self._scheduler_output(new_req, 1))
+
+        state = runner._request_states["r"]
+        assert state.token_ids == [1, 2, 3, 4, 5, 6]
+        assert state.prompt_len == 4

@@ -3,10 +3,12 @@
 
 import hashlib
 import uuid
+from types import SimpleNamespace
 
 import numpy as np
+import psutil
 import pytest
-from vllm.v1.kv_offload.base import ReqContext
+from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 
@@ -102,6 +104,105 @@ def test_region_registry_shares_and_releases() -> None:
     d.cleanup()
 
 
+def test_released_region_frees_its_pages() -> None:
+    """Sleep frees the pool in place. USS is the footprint on macOS."""
+    storage = make_storage()
+    region = make_region(storage, num_cpu_chunks=4096)
+    sample = region.total_size_bytes
+    try:
+        # Random bytes, so the compressor cannot shrink the pages first.
+        rng = np.random.default_rng(0)
+        region._base.numpy()[:] = rng.integers(-128, 128, sample, dtype=np.int8)
+        before = psutil.Process().memory_full_info().uss
+        region.release_pages()
+        released = psutil.Process().memory_full_info().uss
+        assert before - released > sample // 2
+
+        # Writes before reuse_pages are not counted and the kernel may drop
+        # them. The pool is counted again once it is reused.
+        region.reuse_pages()
+        region._base.numpy()[:] = rng.integers(-128, 128, sample, dtype=np.int8)
+        reused = psutil.Process().memory_full_info().uss
+        assert reused - released > sample // 2
+    finally:
+        region.cleanup()
+
+
+def test_failed_release_keeps_the_pool(caplog) -> None:
+    """Freeing the pool is an optimisation, so a failure must not fail sleep."""
+    storage = make_storage()
+    region = make_region(storage)
+
+    def refuse(advice):
+        raise OSError("madvise refused")
+
+    assert region._state is not None
+    mapping = region._state.mapping
+    region._state.mapping = SimpleNamespace(madvise=refuse)
+    try:
+        region._base[0] = 7
+        region.release_pages()
+        assert int(region._base[0]) == 7
+        assert "Could not free" in caplog.text
+    finally:
+        region._state.mapping = mapping
+        region.cleanup()
+
+
+def test_failed_reuse_raises() -> None:
+    """Wake must not go on: the kernel can drop writes to pages not taken back."""
+    region = make_region(make_storage())
+
+    def refuse(advice):
+        raise OSError("madvise refused")
+
+    assert region._state is not None
+    mapping = region._state.mapping
+    region._state.mapping = SimpleNamespace(madvise=refuse)
+    try:
+        with pytest.raises(OSError):
+            region.reuse_pages()
+    finally:
+        region._state.mapping = mapping
+        region.cleanup()
+
+
+def test_released_pool_round_trips_after_reuse() -> None:
+    """After wake the same views store and load, and the scheduler side
+    reads the stored bytes, so the disk tier still sees them."""
+    storage = make_storage()
+    engine_id = f"test-{uuid.uuid4().hex[:8]}"
+    worker = make_worker(
+        storage,
+        blocks_per_chunk=BLOCKS_PER_CHUNK,
+        num_cpu_chunks=NUM_CHUNKS,
+        region=_attach(storage, 0, engine_id),
+    )
+    scheduler = _attach(storage, None, engine_id)
+    try:
+        randomize(storage)
+        assert worker.submit_store(1, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        worker.release_host_pool()
+        worker.restore_host_pool()
+
+        randomize(storage, seed=1)
+        original = snapshot_blocks(storage, [3, 4])
+        assert worker.submit_store(2, gpu_spec([3, 4]), CPULoadStoreSpec([1]))
+        row = scheduler.total_size_bytes // NUM_CHUNKS
+        assert bytes(scheduler._base[row : 2 * row].numpy()) == bytes(
+            worker.region._base[row : 2 * row].numpy()
+        )
+        assert any(scheduler._base[row : 2 * row].numpy())
+
+        zero_blocks(storage, [3, 4])
+        assert worker.submit_load(3, CPULoadStoreSpec([1]), gpu_spec([3, 4]))
+        for a, b in zip(original, snapshot_blocks(storage, [3, 4]), strict=True):
+            np.testing.assert_array_equal(a, b)
+    finally:
+        worker.shutdown()
+        scheduler.cleanup()
+
+
 def test_region_geometry_mismatch_rejected() -> None:
     storage = make_storage()
     engine_id = f"test-{uuid.uuid4().hex[:8]}"
@@ -191,6 +292,24 @@ def test_tiering_spec_builds_manager_through_upstream(tmp_path) -> None:
     assert manager is not None
     (tier,) = manager.secondary_tiers
     assert isinstance(tier, MetalFileSystemTierManager)
+
+
+def test_reset_empties_the_host_pool_index() -> None:
+    """Sleep frees the pool's pages. That is only safe because the reset
+    vLLM runs first leaves no hit that would read them."""
+    manager = MetalTieringOffloadingSpec(_offloading_config()).get_manager()
+    try:
+        ctx = ReqContext(req_id="r-sleep")
+        manager.on_new_request(ctx)
+        key = make_offload_key(hashlib.sha256(b"slept").digest(), 0)
+        assert manager.prepare_store([key], ctx) is not None
+        manager.complete_store([key], ctx)
+        assert manager.lookup(key, ctx) is LookupResult.HIT
+
+        manager.reset_cache()
+        assert manager.lookup(key, ctx) is LookupResult.MISS
+    finally:
+        manager.shutdown()
 
 
 def test_events_reach_the_manager_from_the_disk_tier(tmp_path) -> None:

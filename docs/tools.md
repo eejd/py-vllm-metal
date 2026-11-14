@@ -6,22 +6,27 @@ With the project environment active, compare paged serving against a fresh refer
 
 ```bash
 python tools/check_parity.py --model Qwen/Qwen3-0.6B
+VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  python tools/check_parity.py --model Qwen/Qwen3-0.6B --top-k 5
 python tools/check_parity.py --model /path/to/checkpoint --top-k 5 --batch-size 1 2 --output-dir parity-results
+python tools/check_parity.py --model LiquidAI/LFM3-1.7B-MLX-4bit --reference-backend mlx-vlm --trust-remote-code --top-k 5
 ```
 
-The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs.
+The tool generates the native MLX reference once and exits that process before starting one `vllm serve` instance. It checks `/health`, compares individual prompts and pairs of prompts through `/v1/completions`, then stops the server. The server's sequence limit is the largest requested batch size, and prefix caching is disabled. Each pair is submitted in one HTTP request. These are request batch sizes, not assertions about the actual GPU batch size. Both backends use the same checkpoint and input token IDs. MPS serving disables PyTorch's optional CPU fallback.
 
-The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
+The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and 10 output tokens, ignoring EOS. Use `--prompt` for custom text, `--max-tokens` for output length, `--trust-remote-code` for checkpoints that ship their own config code, and `--help` for all options. Inputs are plain text without a chat template. Logs, the native reference, and a summary are saved to `--output-dir`, or a new temporary directory printed at startup. The tool selects an available localhost port automatically.
 
 - `EXACT`: every output token matches.
 - `TOP_K_MATCH`: the first divergence passes mutual top-K membership; later tokens are not compared. Enabled with `--top-k K`.
 - `FAIL`: a mismatch fails the comparison, or generation is incomplete.
 
+Parity checks may be unreliable for MoE models. When mismatches occur, investigate routing flips between experts with nearly tied scores.
+
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
 ## Speculative decoding
 
-Use the same parity command for DFlash, DSpark, or an ordinary draft model:
+Use the same parity command with the MLX backend for DFlash, DSpark, or an ordinary draft model:
 
 ```bash
 python -m tools.check_parity \
@@ -48,18 +53,21 @@ workers, and a speculative run must exercise draft verification.
 Use `--audit-continuations` to additionally replay every emitted prefix through
 native MLX. Any strict greedy mismatch fails this audit, even if the first
 divergence passes top-k comparison. Raw outputs and reports are retained on a
-comparison failure. See [DSpark qualification](dspark.md#full-continuation-audit)
-for the audit's scope.
+comparison failure.
 
 This replaces `tools.dflash_serving_parity`: use `tools.check_parity --method
 dflash --model ...` instead, retaining the other draft options. The draft-forward
 and paged-cache diagnostics remain separate because they test different contracts.
-Measure speed separately with the [serving benchmark](dspark.md#measure-http-serving-and-memory).
+Measure speed separately with the [DSpark serving benchmark](https://github.com/vllm-project/vllm-metal/blob/main/tools/benchmark/dspark_serving_benchmark.py).
 
 ## Scheduled and requested CI
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.
 
-Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on macOS 15 and 26 with Xcode 26.3: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
+Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
 
-The `Parity` check links to job summaries and artifacts containing the native reference, server log, and per-batch results, retained for 14 days. Regular PR CI runs fast tests without starting model servers.
+The Qwen3-0.6B job also checks speculative output parity and FP32 acceptance
+and rejection recovery, including prefix-cache reuse.
+
+The `Parity` check links to summary tables and diagnostic artifacts, retained
+for 14 days. Regular PR CI runs fast tests without starting model servers.

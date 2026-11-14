@@ -9,6 +9,8 @@ kernel-compatible block sizes (8, 16, 32).
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -183,12 +185,10 @@ class TestMLAKernelBlockSizes:
         / "kernels_v2"
         / "mla.metal"
     )
-    _PAGED_OPS = (
-        Path(__file__).resolve().parent.parent
-        / "vllm_metal"
-        / "metal"
-        / "paged_ops.cpp"
+    _MLA_OPS = (
+        Path(__file__).resolve().parent.parent / "vllm_metal" / "metal" / "mla.cpp"
     )
+    _PAGED_ATTENTION_OPS = _MLA_OPS.with_name("paged_attention.cpp")
 
     def _instantiations(self) -> set[tuple[str, int, int, int, int, int, int]]:
         """The full (type, kvr, pe, bs, g, nt, ps) tuple per call site.
@@ -219,12 +219,12 @@ class TestMLAKernelBlockSizes:
     def _gate_rows(self) -> list[tuple[int, int, int, int, int, int]]:
         """The (kvr, pe, bs, g, nt, ps) rows of the shared spec table.
 
-        ``kMlaKernelSpecs`` in paged_ops.cpp is the single source of truth
+        ``kMlaKernelSpecs`` in mla.cpp is the single source of truth
         the dispatch gate validates against — one ``{kvr, pe, bs, g, nt,
         ps}`` row per instantiated shape. A list (not a set) so duplicate
         rows stay visible to the geometry-uniqueness check.
         """
-        cpp = self._PAGED_OPS.read_text()
+        cpp = self._MLA_OPS.read_text()
         table = cpp[cpp.index("kMlaKernelSpecs") :]
         rows = [
             tuple(int(v) for v in m.groups())
@@ -251,14 +251,17 @@ class TestMLAKernelBlockSizes:
         row without an instantiation throws at runtime. The call sites
         must be exactly the table's admitted space.
         """
-        cpp = self._PAGED_OPS.read_text()
+        cpp = self._MLA_OPS.read_text()
 
         # mla_validate_t_dtypes admits only fp16/bf16 for the T buffers; map
         # them through dtype_to_metal to the instantiated type names.
         dtype_map = dict(
             re.findall(
                 r'case (\w+):\s*return "(\w+)";',
-                self._fn_body(cpp, "static std::string dtype_to_metal"),
+                self._fn_body(
+                    self._PAGED_ATTENTION_OPS.read_text(),
+                    "std::string dtype_to_metal",
+                ),
             )
         )
         gate_dtypes = {
@@ -293,10 +296,346 @@ class TestMLAKernelBlockSizes:
         assert geometries and max(geometries.values()) == 1, geometries
 
 
+@pytest.fixture(scope="module")
+def nax_policy_binary(tmp_path_factory):
+    """Call the actual host admission and name helpers without loading a GPU."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("The header-policy test requires a C++17 compiler")
+    directory = tmp_path_factory.mktemp("nax-config")
+    source = directory / "check.cpp"
+    source.write_text(
+        '#include "paged_attention_kernels.h"\n'
+        "#include <cstdlib>\n#include <iostream>\n#include <iomanip>\n"
+        "int main(int argc, char** argv) {\n"
+        "  using namespace vllm_metal::kernels;\n"
+        '  if (argc == 2 && std::string(argv[1]) == "work") {\n'
+        "    int q, prefix, heads, kv, bq, split;\n"
+        "    std::cout << std::setprecision(17);\n"
+        "    while (std::cin >> q >> prefix >> heads >> kv >> bq >> split) {\n"
+        "      auto w = nax_prefill_work(q, prefix, heads, kv, bq, split);\n"
+        "      std::cout << w.issued << ' ' << w.active << ' ' << w.guarded\n"
+        "        << ' ' << w.guarded_q << ' ' << w.kv_edge << ' ' << w.fast\n"
+        "        << ' ' << w.stream << ' ' << w.tail_stream << ' ' << w.groups\n"
+        "        << ' ' << w.full_blocks << '\\n';\n"
+        "    }\n"
+        "    return 0;\n"
+        "  }\n"
+        "  if (argc != 15) return 2;\n"
+        "  auto cfg = select_nax_config(\n"
+        "      std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3]),\n"
+        "      std::atoi(argv[4]), std::atoi(argv[5]), std::atoi(argv[6]),\n"
+        "      std::atoi(argv[7]), std::atoi(argv[8]), std::atoi(argv[9]),\n"
+        "      std::atoi(argv[10]), std::atoi(argv[11]), std::atoi(argv[12]), std::atoi(argv[14]));\n"
+        "  cfg = nax_config_for_pipeline(cfg, std::strtoul(argv[13], nullptr, 10));\n"
+        "  std::cout << cfg.BQ << ' ' << cfg.HEADS_PER_TG << ' '\n"
+        "      << cfg.NUM_THREADS << ' '\n"
+        '      << nax_name(std::atoi(argv[10]) ? "bfloat16_t" : "half",\n'
+        "          std::atoi(argv[3]), std::atoi(argv[4]), cfg);\n"
+        "}\n"
+    )
+    binary = directory / "check"
+    include = Path(__file__).resolve().parent.parent / "vllm_metal/metal"
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-I", str(include), str(source), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return binary
+
+
+@pytest.fixture(scope="module")
+def nax_config_runner(nax_policy_binary):
+    def run(
+        *,
+        heads=24,
+        kv_heads=4,
+        head_dim=256,
+        page=16,
+        q=144,
+        seqs=1,
+        prefix=31360,
+        offset=0,
+        enabled=1,
+        bf16=1,
+        unmasked=1,
+        upstream_split=0,
+        capacity=1024,
+        cores=40,
+    ):
+        args = (
+            heads,
+            kv_heads,
+            head_dim,
+            page,
+            q,
+            seqs,
+            prefix + q,
+            offset,
+            enabled,
+            bf16,
+            unmasked,
+            upstream_split,
+            capacity,
+            cores,
+        )
+        result = subprocess.run(
+            [str(nax_policy_binary), *map(str, args)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        bq, group, threads, name = result.stdout.split()
+        return (int(bq), int(group), int(threads)), name
+
+    return run
+
+
+def _nax_work_loop(q, prefix, heads, kv_heads, bq, split):
+    """Count causal KV visits per Q block, without the closed-form sums."""
+    visits = active = fast = edges = tail = full = blocks = 0
+    for start in range(0, q, bq):
+        valid_q = min(bq, q - start)
+        tiles = len(range(0, prefix + start + valid_q, 32))
+        visits += tiles
+        active += len(range(0, valid_q, 16)) * tiles
+        blocks += 1
+        if valid_q == bq:
+            full += 1
+            edge = int(tiles * 32 > prefix + q)
+            edges += edge
+            if split:
+                fast += tiles - edge
+        else:
+            tail = tiles
+    scale = heads * (bq // 16)
+    return (
+        scale * visits,
+        heads * active,
+        scale * (visits - fast),
+        scale * tail,
+        scale * edges,
+        scale * fast,
+        visits / blocks,
+        tail,
+        (heads if bq == 64 else kv_heads) * blocks,
+        full,
+    )
+
+
+def test_nax_work_counts_match_independent_causal_loop(nax_policy_binary):
+    """Protect every prefix/Q residue and longer full/tail/edge combinations."""
+    lengths = [(q, prefix) for prefix in range(32) for q in range(1, 65)]
+    lengths += [
+        (q, prefix)
+        for prefix in (31, 32, 33, 31360, 65535, 65536, 65537)
+        for q in (127, 128, 129, 1327, 1328, 1329, 32767, 32768, 32769)
+    ]
+    cases = [
+        (q, prefix, heads, kv, bq, split)
+        for q, prefix in lengths
+        for heads, kv in ((24, 4), (54, 9))
+        for bq in (16, 64)
+        for split in (0, 1)
+    ]
+    result = subprocess.run(
+        [str(nax_policy_binary), "work"],
+        input="\n".join(" ".join(map(str, case)) for case in cases) + "\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = result.stdout.splitlines()
+    assert len(rows) == len(cases)
+    for case, row in zip(cases, rows, strict=True):
+        actual = tuple(map(float, row.split()))
+        assert actual == _nax_work_loop(*case), case
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"enabled": 0},
+        {"bf16": 0},
+        {"unmasked": 0},
+        {"seqs": 2},
+        {"offset": 1},
+        {"head_dim": 512},
+        {"page": 8},
+        {"page": 32},
+        {"cores": 0},
+        {"q": 0},
+        {"q": 1},
+        {"prefix": -1},
+        {"heads": 0},
+        {"kv_heads": 0},
+        {"heads": 25},
+    ],
+)
+def test_nax_grouped_preserves_unsupported_and_unknown_fallbacks(
+    nax_config_runner, changes
+):
+    cfg, name = nax_config_runner(**changes)
+    assert cfg == (64, 1, 128)
+    assert "_gqa" not in name
+
+
+@pytest.mark.parametrize(
+    ("changes", "group", "suffix"),
+    [
+        ({"q": 144}, 3, "_gqa6_sub_full"),
+        ({"q": 144, "cores": 10}, 6, "_gqa6_full"),
+        ({"q": 128, "cores": 10}, 6, "_gqa6_full"),
+        ({"q": 2048, "prefix": 0, "cores": 10, "upstream_split": 1}, 6, "_gqa6_full"),
+        (
+            {"q": 2049, "prefix": 30719, "cores": 10, "upstream_split": 1},
+            6,
+            "_gqa6_full",
+        ),
+        (
+            {
+                "heads": 48,
+                "kv_heads": 8,
+                "q": 2048,
+                "prefix": 0,
+                "cores": 20,
+                "upstream_split": 1,
+            },
+            6,
+            "_gqa6_full",
+        ),
+        (
+            {
+                "heads": 96,
+                "kv_heads": 16,
+                "q": 1280,
+                "prefix": 8192,
+                "cores": 40,
+                "upstream_split": 1,
+            },
+            6,
+            "_gqa6_full",
+        ),
+        (
+            {
+                "heads": 96,
+                "kv_heads": 16,
+                "q": 1280,
+                "prefix": 8192,
+                "cores": 80,
+                "upstream_split": 1,
+            },
+            1,
+            "",
+        ),
+        (
+            {"heads": 18, "kv_heads": 3, "q": 208, "prefix": 24577, "cores": 10},
+            3,
+            "_gqa6_sub_full",
+        ),
+        (
+            {"heads": 30, "kv_heads": 5, "q": 144, "prefix": 24577, "cores": 10},
+            3,
+            "_gqa6_sub_full",
+        ),
+        (
+            {"heads": 48, "kv_heads": 8, "q": 144, "prefix": 24577, "cores": 20},
+            3,
+            "_gqa6_sub_full",
+        ),
+        (
+            {"heads": 96, "kv_heads": 16, "q": 144, "prefix": 24577, "cores": 40},
+            3,
+            "_gqa6_sub_full",
+        ),
+        (
+            {"q": 2048, "prefix": 32768, "cores": 10, "upstream_split": 1},
+            6,
+            "_gqa6_full",
+        ),
+        ({"q": 144, "prefix": 31361}, 3, "_gqa6_sub_full"),
+        ({"q": 16}, 3, "_gqa6_sub_full"),
+        ({"q": 144, "prefix": 65536, "cores": 10}, 6, "_gqa6_full"),
+        (
+            {
+                "heads": 48,
+                "kv_heads": 8,
+                "q": 1281,
+                "prefix": 65537,
+                "cores": 20,
+                "upstream_split": 1,
+            },
+            6,
+            "_gqa6_full",
+        ),
+        (
+            {
+                "heads": 96,
+                "kv_heads": 16,
+                "q": 1280,
+                "prefix": 129792,
+                "cores": 40,
+                "upstream_split": 1,
+            },
+            6,
+            "_gqa6_full",
+        ),
+        ({"q": 64, "cores": 10}, 3, "_gqa6_sub_full"),
+        ({"q": 64, "cores": 20}, 1, ""),
+        ({"q": 63}, 1, ""),
+        ({"q": 65}, 1, ""),
+        ({"q": 143}, 1, ""),
+        ({"q": 145}, 1, ""),
+        ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 6, "_gqa6_full"),
+        ({"heads": 12, "kv_heads": 2, "q": 144}, 3, "_gqa6_sub_full"),
+        (
+            {
+                "heads": 90,
+                "kv_heads": 15,
+                "q": 415,
+                "prefix": 32258,
+                "upstream_split": 1,
+            },
+            6,
+            "_gqa6_full",
+        ),
+        ({"heads": 16, "kv_heads": 2, "page": 32, "q": 128}, 1, ""),
+        ({"q": 2048, "prefix": 0, "upstream_split": 1}, 1, ""),
+    ],
+)
+def test_nax_grouped_selects_width_from_capacity_and_real_work(
+    nax_config_runner, changes, group, suffix
+):
+    """Core count, absolute heads and guarded tails can change the route."""
+    cfg, name = nax_config_runner(**changes)
+    assert cfg == ((64, 1, 128) if group == 1 else (16, group, 32 * group))
+    assert name == (
+        f"paged_attention_nax_bfloat16_t_hs256_bs{changes.get('page', 16)}{suffix}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "capacity", "expected"),
+    [
+        ({}, 95, (64, 1, 128)),
+        ({}, 96, (16, 3, 96)),
+        ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 191, (64, 1, 128)),
+        ({"q": 1568, "prefix": 31199, "upstream_split": 1}, 192, (16, 6, 192)),
+    ],
+)
+def test_nax_grouped_capacity_falls_back_at_the_pipeline_limit(
+    nax_config_runner, changes, capacity, expected
+):
+    cfg, name = nax_config_runner(**changes, capacity=capacity)
+    assert cfg == expected
+    assert ("_gqa" in name) == (expected[1] > 1)
+
+
 class TestNaxKernelInstantiations:
     """The NAX prefill gate and its kernel instantiations cannot drift.
 
-    ``nax_eligible`` in paged_ops.cpp admits a (dtype, head_size, block_size)
+    ``nax_eligible`` in paged_attention.cpp admits a (dtype, head_size, block_size)
     space; ``instantiate_paged_attention_nax_all`` in
     pagedattention_nax.metal compiles one specialization per admitted row.
     An instantiation beyond the gate compiles dead binary; a gate value
@@ -310,7 +649,7 @@ class TestNaxKernelInstantiations:
         / "kernels_v2"
         / "pagedattention_nax.metal"
     )
-    _PAGED_OPS = TestMLAKernelBlockSizes._PAGED_OPS
+    _PAGED_ATTENTION_OPS = TestMLAKernelBlockSizes._PAGED_ATTENTION_OPS
 
     def _instantiations(self) -> set[tuple[str, int, int]]:
         """The (metal-type, head_size, block_size) rows the library compiles.
@@ -339,7 +678,7 @@ class TestNaxKernelInstantiations:
         return {(t, hs, bs) for t in dtypes for hs, bs in shapes}
 
     def test_instantiations_match_the_cpp_gate(self) -> None:
-        cpp = self._PAGED_OPS.read_text()
+        cpp = self._PAGED_ATTENTION_OPS.read_text()
         gate = TestMLAKernelBlockSizes._fn_body(cpp, "static bool nax_eligible")
 
         head_sizes = {int(v) for v in re.findall(r"head_size == (\d+)", gate)}
@@ -347,9 +686,7 @@ class TestNaxKernelInstantiations:
         dtype_map = dict(
             re.findall(
                 r'case (\w+):\s*return "(\w+)";',
-                TestMLAKernelBlockSizes._fn_body(
-                    cpp, "static std::string dtype_to_metal"
-                ),
+                TestMLAKernelBlockSizes._fn_body(cpp, "std::string dtype_to_metal"),
             )
         )
         gate_dtypes = {dtype_map[d] for d in re.findall(r"dtype == (\w+)", gate)}

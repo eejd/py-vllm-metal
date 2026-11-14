@@ -2,7 +2,9 @@
 
 vllm-metal ships an in-process **frame-capture profiler** that records every Metal command issued during inference. Captures open in Xcode's GPU Frame Debugger and give you per-kernel GPU timing (via the **Profile** button), command ordering, and full buffer state — everything you typically want for both performance and correctness debugging on Apple Silicon. **This is the recommended path.**
 
-The profiler plugs into vLLM's standard profiler API — `LLM.start_profile()`, the `POST /start_profile` HTTP endpoint, etc. — and calls `mlx.metal.start_capture` underneath. Captures must be bounded (see the [recommended recipe](#recommended-starting-recipe)).
+The profiler plugs into vLLM's standard profiler API — `LLM.start_profile()`, the `POST /start_profile` HTTP endpoint, etc. — and uses the selected backend's native capture API: `mlx.metal.start_capture` / `stop_capture` for MLX, or `torch.mps.profiler.metal_capture` for PyTorch MPS. Captures must be bounded (see the [recommended recipe](#recommended-starting-recipe)).
+
+PyTorch 2.13 first writes a numbered trace in the worker's current directory, which must be writable. The wrapper moves it into `torch_profiler_dir` when capture stops.
 
 For users already familiar with Apple's Instruments.app, Apple's `xctrace` is available as a lower-overhead, whole-process alternative for wall-clock and GPU-utilization views — see [Advanced: xctrace](#advanced-xctrace) at the end. It's a different mental model and doesn't surface MLX kernel names; reach for it only if you already know how to read Metal System Trace.
 
@@ -155,6 +157,45 @@ process environment. Restart the engine with that variable set, then retry.
 ```
 
 **No semantic range markers.** Unlike CUDA's NVTX or torch.profiler's `record_function`, Metal frame capture has no API for inserting named ranges. Kernel-level granularity (each MLX op shows up as a labeled Metal dispatch) is what you get; if you need per-layer or per-stage labels, those would require adding `os_signpost` calls in the C++ extension — not currently supported.
+
+## Diagnostic: NAX prefill dispatch trace
+
+Frame capture shows every Metal command but is slow and large. To check only which NAX prefill kernel was encoded, and with what launch geometry, use the lightweight CPU-side dispatch trace instead. It needs no Xcode and no `MTL_CAPTURE_ENABLED`, and it is off by default.
+
+The trace records the kernel actually encoded, after any pipeline fallback. Call both functions while evaluation is idle, in the process that executes attention:
+
+```python
+from vllm_metal.metal import get_ops
+
+ops = get_ops()
+ops._start_nax_prefill_dispatch_trace()  # clear and enable
+# ... run the prefill you want to inspect ...
+trace = ops._take_nax_prefill_dispatch_trace()  # disable, return and clear
+
+for event in trace["events"]:
+    print(
+        event["function"],
+        event["BQ"],
+        event["HEADS_PER_TG"],
+        (event["gridx"], event["gridy"], event["gridz"]),
+        event["threads"],
+    )
+```
+
+| Returned key | Meaning |
+|---|---|
+| `events` | One dict per encoded dispatch: kernel `function`, `family`, `dtype`, `BQ`, `HEADS_PER_TG`, grid and `threads`, query geometry (`q`, `hq`, `hkv`, `d`, `numseq`, `max_seq_len`), translated KV strides, and `sliding_window` / `softcap` / `use_sinks` |
+| `capacity` | Maximum events kept per process (8192) |
+| `overflow`, `dropped_events` | Whether, and how many, events were dropped after the buffer filled |
+| `dispatch_count` | Kept plus dropped events |
+| `append_time_ns` | Host time spent recording; it does not include GPU time |
+
+Limitations:
+
+- Events are in append order. They do not show GPU execution order or which request a dispatch belonged to, and with concurrent encoding threads the order may differ from call order.
+- Only NAX prefill dispatches are recorded; other attention paths and other kernels are not.
+- Tracing adds host work while enabled, so don't use it for timing. Use frame capture for per-kernel GPU timing.
+- These are private (`_`-prefixed) diagnostic hooks and may change.
 
 ## Advanced: xctrace
 

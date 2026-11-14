@@ -189,10 +189,10 @@ def test_block_stride_spans_the_upstream_page():
 def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     from types import SimpleNamespace
 
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 
     from tests.stub_runner import make_cache_config
-    from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+    from vllm_metal.tensor_bridge import torch_to_mlx
     from vllm_metal.v1.cache_policy import WorkerCachePlanner
 
     groups = make_storage().config.kv_cache_groups
@@ -243,3 +243,33 @@ def test_budget_above_buffer_limit_uses_shared_regions(monkeypatch):
     assert len({tensor.untyped_storage().data_ptr() for tensor in imported}) == 1
     assert sum(buffer.nbytes for buffer in storage.buffers) == storage.nbytes
     assert storage.state_views(["s0", "s1"])[0][0].shape[0] == planned.num_blocks
+
+
+def test_release_frees_backing_and_reallocate_rebinds_existing_views():
+    storage = make_storage(num_blocks=64)
+    views = storage.views([storage.tensors["a0"]])
+    offsets = storage.region_offsets
+    before = mx.get_active_memory()
+
+    storage.release()
+
+    assert storage.released
+    assert before - mx.get_active_memory() >= storage.nbytes
+
+    storage.reallocate()
+    storage.tensors["a0"].fill_(3)
+
+    assert storage.region_offsets == offsets
+    np.testing.assert_array_equal(np.array(views[0]), 3)
+
+
+def test_count_initialized_runtime_refuses_sleep_release():
+    from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
+
+    runtime = SDPAPagedAttentionRuntime(
+        num_layers=1, num_kv_heads=1, head_dim=64, block_size=16, dtype=mx.float32
+    )
+    runtime.initialize(4)
+
+    with pytest.raises(NotImplementedError, match="Sleep mode does not support"):
+        runtime.release_kv_memory()

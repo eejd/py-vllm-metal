@@ -14,7 +14,7 @@ record that it handles preemptions before opening the step, then stopped with
 a deliberate raise. That pins the call order itself, and leaves the step open
 as a real failure would. The cross-step tests chain steps to pin the lifecycle
 across a step boundary, which no single ``execute_model`` call can show. The
-real ``MetalKVConnector`` runs throughout, over a spy transfer group.
+real ``ActiveKVConnector`` runs throughout, over a spy transfer group.
 """
 
 from __future__ import annotations
@@ -231,11 +231,10 @@ def no_connector(monkeypatch) -> None:
     def forbidden(*args, **kwargs):
         raise AssertionError("connector touched without a KV connector")
 
-    import vllm_metal.v1.kv_connector as metal_kv_connector
+    import vllm.v1.worker.gpu.kv_connector as upstream
 
     monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
-    monkeypatch.setattr(mr, "get_kv_transfer_group", forbidden)
-    monkeypatch.setattr(metal_kv_connector, "get_kv_transfer_group", forbidden)
+    monkeypatch.setattr(upstream, "get_kv_transfer_group", forbidden)
 
 
 def test_zero_token_step_without_connector_is_unchanged(no_connector):
@@ -294,13 +293,7 @@ def _sdpa_runtime():
     )
 
 
-def test_register_hands_the_runtime_storage_to_the_connector(monkeypatch):
-    registered = []
-    monkeypatch.setattr(
-        mr,
-        "get_kv_transfer_group",
-        lambda: SimpleNamespace(register_kv_caches=registered.append),
-    )
+def test_register_hands_the_runtime_storage_to_the_connector(spy_group):
     runtime = _sdpa_runtime()
     storage = object()
     runtime._storage = storage
@@ -309,7 +302,8 @@ def test_register_hands_the_runtime_storage_to_the_connector(monkeypatch):
 
     runner.register_kv_connector_caches()
 
-    assert registered == [storage]
+    assert spy_group.registered == [{}, storage]  # {}: the fixture's driver
+    assert runner._kv_connector() is not mr.MetalModelRunner._kv_connector_driver
 
 
 @pytest.mark.parametrize(
@@ -322,10 +316,12 @@ def test_register_hands_the_runtime_storage_to_the_connector(monkeypatch):
     ],
 )
 def test_register_rejects_runtimes_without_storage(monkeypatch, runtime_factory):
+    import vllm.v1.worker.gpu.kv_connector as upstream
+
     def forbidden():
         raise AssertionError("registered a runtime without storage")
 
-    monkeypatch.setattr(mr, "get_kv_transfer_group", forbidden)
+    monkeypatch.setattr(upstream, "get_kv_transfer_group", forbidden)
     runner = make_stub_runner(model=SimpleNamespace())
     runner._paged_attention_runtime = runtime_factory()
 

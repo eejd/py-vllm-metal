@@ -30,7 +30,9 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 from __future__ import annotations
 
+import functools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -63,6 +65,7 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
+from vllm_metal.attention.nax_split import nax_split_kwargs, nax_tile_work
 from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
@@ -253,6 +256,17 @@ def _apply_qk_norms(
     return queries, keys
 
 
+def _norm_then_scale_queries(
+    q_norm: Callable[[mx.array], mx.array], scale: float, queries: mx.array
+) -> mx.array:
+    """Normalize, then scale in fp32 and cast back (Muse Glimmer, before RoPE).
+
+    vLLM and mlx-vlm apply Glimmer's query scale in this order.
+    """
+    queries = q_norm(queries)
+    return (queries.astype(mx.float32) * scale).astype(queries.dtype)
+
+
 # === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
 
 
@@ -298,7 +312,7 @@ def prepare_sdpa_qkv(
         - ``queries``, ``keys``, ``values``: ``(B, H, L, head_dim)`` tensors
           ready for the Metal kernel.
         - ``gate``: optional gate tensor for gated attention (Qwen3.5
-          Qwen3Next style), else ``None``.
+          Qwen3Next style, or Muse Glimmer's ``gate_proj``), else ``None``.
         - ``kv_for_sharing``: the post-norm+RoPE ``(keys, values)`` pair so
           the caller can forward them to the next YOCO layer.
 
@@ -311,6 +325,17 @@ def prepare_sdpa_qkv(
     norm_placement = attention_contract.qk_norm_placement
     q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
     k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm")
+    if attention_contract.scaleless_qk_norm:
+        q_norm = k_norm = functools.partial(
+            mx.fast.rms_norm, weight=None, eps=inner.eps
+        )
+    if attention_contract.shared_qk_norm:
+        q_norm = k_norm = inner.qk_norm
+    if attention_contract.post_norm_query_scale:
+        # From here on, q_norm also applies the query scale.
+        q_norm = functools.partial(
+            _norm_then_scale_queries, q_norm, inner.qk_scale_factor
+        )
     if shared_kv is not None and read_existing_kv:
         raise ValueError("shared_kv and read_existing_kv are mutually exclusive")
 
@@ -430,6 +455,9 @@ def prepare_sdpa_qkv(
         if norm_placement is QKNormPlacement.AFTER_ROPE:
             queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
 
+    if attention_contract.sigmoid_output_gate:
+        gate = inner.gate_proj(x)
+
     kv_for_sharing = (keys, values)
     return queries, keys, values, gate, kv_for_sharing
 
@@ -523,7 +551,7 @@ def truncate_padded_output(
 # === SDPA forward ===
 
 
-def _float32_sinks(inner: nn.Module) -> mx.array | None:
+def _float32_sinks(inner: nn.Module, attr: str = "sinks") -> mx.array | None:
     """The module's attention sinks as float32, cast once per parameter.
 
     The widened copy is stored outside the parameter tree, so the checkpoint
@@ -531,7 +559,7 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
     walks the parameters. It is keyed by the original array, so a reloaded
     parameter is cast again.
     """
-    sinks = getattr(inner, "sinks", None)
+    sinks = getattr(inner, attr, None)
     if sinks is None or sinks.dtype == mx.float32:
         return sinks
     cached = getattr(inner, "_vllm_metal_sinks_f32", None)
@@ -539,6 +567,103 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
         cached = (sinks, sinks.astype(mx.float32))
         object.__setattr__(inner, "_vllm_metal_sinks_f32", cached)
     return cached[1]
+
+
+def llama4_query_scale(
+    ctx: PagedAttentionContext,
+    beta: float,
+    original_max_position_embeddings: int,
+) -> mx.array | None:
+    """Per-row Llama 4 query scale ``(1, 1, L, 1)`` for the packed batch.
+
+    The scale is ``1 + beta * log(1 + floor(pos / original_max))`` at each
+    row's absolute position, as in mlx_lm's ``ministral3``. It is exactly 1
+    below ``original_max``, so ``None`` is returned when no row reaches it.
+    Computed once per forward and shared by every scaled layer.
+    """
+    key = (beta, original_max_position_embeddings)
+    if key in ctx.llama4_query_scales:
+        return ctx.llama4_query_scales[key]
+    cu_seqlens = ctx.cu_seqlens
+    assert cu_seqlens is not None
+    segments = list(zip(cu_seqlens[:-1], cu_seqlens[1:], ctx.offsets, strict=True))
+    scale = None
+    if any(
+        offset + end - start > original_max_position_embeddings
+        for start, end, offset in segments
+    ):
+        positions = mx.concatenate(
+            [mx.arange(offset, offset + end - start) for start, end, offset in segments]
+        )
+        scale = (
+            1
+            + beta * mx.log(1 + mx.floor(positions / original_max_position_embeddings))
+        )[None, None, :, None]
+    ctx.llama4_query_scales[key] = scale
+    return scale
+
+
+def _gqa_disabled_kwargs(ctx: PagedAttentionContext, ops: Any) -> dict[str, Any]:
+    """The GQA kill switch for any native call, gated on build support."""
+    if ctx.paged_native_capabilities is None:
+        ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+    capabilities = ctx.paged_native_capabilities
+    if not ctx.gqa_disabled:
+        return {}
+    if capabilities["gqa_disable"]:
+        return {"gqa_disabled": True}
+    if capabilities["gqa_decode"]:
+        # Never silently ignore a kill switch on an unrecognized GQA build.
+        raise RuntimeError(
+            "Loaded native GQA build does not advertise disable support; "
+            "rebuild the vllm-metal native extension."
+        )
+    # Pre-GQA native builds already use the established attention path.
+    return {}
+
+
+def _whole_batch_decode_routing_kwargs(
+    ctx: PagedAttentionContext, num_query_rows: int, ops: Any
+) -> dict[str, Any]:
+    """Decode routing keywords for a call over every query row of the batch."""
+    kwargs = _gqa_disabled_kwargs(ctx, ops)
+    capabilities = ctx.paged_native_capabilities
+    assert capabilities is not None
+    if capabilities["decode_routing_metadata"]:
+        kwargs.update(
+            num_decode_requests=ctx.num_decode_requests,
+            num_decode_tokens=ctx.num_decode_tokens,
+            max_decode_context_len=ctx.max_decode_context_len,
+        )
+    num_decode = ctx.num_decode_requests
+    ordinary_decode_rows = (
+        not ctx.gqa_disabled
+        and num_decode == ctx.num_decode_tokens
+        and ctx.verify_window_q == 1
+    )
+    if (
+        capabilities["gqa_length_plan"]
+        and ordinary_decode_rows
+        and num_decode > 1
+        and num_decode == num_query_rows == len(ctx.context_lens)
+    ):
+        if ctx.gqa_length_plan is None:
+            ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
+        kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+    elif (
+        capabilities["gqa_mixed_decode_plan"]
+        and ordinary_decode_rows
+        and 0 < num_decode < len(ctx.context_lens)
+        and num_query_rows > num_decode
+    ):
+        # Mixed batch: describe only the leading decode rows. Native code
+        # uses it when it splits those rows from the prefill kernel.
+        if ctx.gqa_length_plan is None:
+            ctx.gqa_length_plan = ops.gqa_decode_length_plan(
+                ctx.context_lens[:num_decode]
+            )
+        kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+    return kwargs
 
 
 def sdpa_forward(
@@ -552,12 +677,16 @@ def sdpa_forward(
     read_existing_kv: bool = False,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
     attention_contract: AttentionContract = DEFAULT_ATTENTION_CONTRACT,
+    llama4_scaling: tuple[float, int] | None = None,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Full SDPA forward pass: project → norm/RoPE → Metal kernel.
 
     Handles MHA, GQA, and MQA uniformly — the head ratio between
     query and KV heads is passed to the Metal kernel which handles
     the broadcast internally.
+
+    ``llama4_scaling`` is ``(beta, original_max_position_embeddings)`` for
+    attention that scales queries by position after RoPE (Ministral 3).
 
     Returns:
         Tuple of (output, kv_pair) where kv_pair is (keys, values)
@@ -598,7 +727,7 @@ def sdpa_forward(
     # sinks leave this None and the kernel keeps its plain-softmax path.
     # The kernel reads them as device float; the cast is memoized off the
     # module's parameter tree, since this is the per-layer hot path.
-    sinks = _float32_sinks(inner)
+    sinks = _float32_sinks(inner, attention_contract.sinks_attr)
 
     queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
         inner,
@@ -620,6 +749,10 @@ def sdpa_forward(
         # StableLM computes the standard scale inline and exposes no scale
         # attribute. Use the projected query width before any cache padding.
         attn_scale = math.sqrt(1 / queries.shape[-1])
+    if llama4_scaling is not None:
+        query_scale = llama4_query_scale(ctx, *llama4_scaling)
+        if query_scale is not None:
+            queries = queries * query_scale.astype(queries.dtype)
 
     # --- Metal kernel dispatch ---
     n_heads = queries.shape[1]
@@ -644,6 +777,9 @@ def sdpa_forward(
         queries, keys, values, head_dim, cache_head_dim
     )
     head_dim = cache_head_dim
+
+    # The attention output keeps the query dtype, not the cache dtype.
+    attention_output_dtype = queries.dtype
 
     # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
     q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(kv_cache.dtype))
@@ -802,7 +938,6 @@ def sdpa_forward(
     mm_kwargs = (
         {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
     )
-    out = mx.array(0)
     if kv_cache.turboquant:
         # Preserve the compressed primitive's layout and rejection contracts
         # for decode, short continuations, verification, sinks and image rows.
@@ -826,10 +961,11 @@ def sdpa_forward(
             v_centroids = get_v_centroids(kv_cache.v_bits)
 
         def quantized_attention(
-            query: mx.array, batch: _AttentionBatch | _KernelMetadata
+            query: mx.array,
+            batch: _AttentionBatch | _KernelMetadata,
+            **routing: Any,
         ) -> mx.array:
-            result = mx.array(0)
-            ops.paged_attention_primitive(
+            return ops.paged_attention_primitive(
                 query,
                 kernel_k_cache,
                 kernel_v_cache,
@@ -842,7 +978,6 @@ def sdpa_forward(
                 kernel_block_size,
                 batch.max_seq_len,
                 layer_sliding_window,
-                result,
                 sinks=sinks,
                 key_scale_cache=kernel_key_scale,
                 value_scale_cache=kernel_value_scale,
@@ -853,8 +988,8 @@ def sdpa_forward(
                 v_bits=kv_cache.v_bits,
                 window_seqlen_q=ctx.verify_window_q,
                 **mm_kwargs,
+                **routing,
             )
-            return result
 
         plan = None
         has_prefill = q_3d.shape[0] > len(ctx.context_lens)
@@ -890,7 +1025,15 @@ def sdpa_forward(
                 value_bits=kv_cache.v_bits,
             )
 
-        if plan is None:
+        if plan is None and not has_prefill:
+            # A whole decode batch carries the same routing metadata as the
+            # ordinary cache path, so native code can admit it to GQA decode.
+            out = quantized_attention(
+                q_3d,
+                meta,
+                **_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops),
+            )
+        elif plan is None:
             out = quantized_attention(q_3d, meta)
         else:
             logger.info_once("Metal: bounded TurboQuant prefill lane active.")
@@ -922,7 +1065,9 @@ def sdpa_forward(
             )
             batch = plan.prefill
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
-            ops.paged_attention_primitive(
+            if ctx.paged_native_capabilities is None:
+                ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+            out = ops.paged_attention_primitive(
                 query,
                 k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
                 v16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
@@ -935,12 +1080,21 @@ def sdpa_forward(
                 kernel_block_size,
                 batch.max_seq_len,
                 layer_sliding_window,
-                out,
                 window_seqlen_q=ctx.verify_window_q,
+                # The dequantized lane only admits full-attention layers.
+                **nax_split_kwargs(
+                    ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
+                ),
             )
             if plan.fallback is not None:
                 fallback = plan.fallback
-                rest = quantized_attention(q_3d[fallback.query_indices], fallback)
+                # A lone compressed decode row would otherwise be admitted to
+                # GQA decode as a one-request batch despite the kill switch.
+                rest = quantized_attention(
+                    q_3d[fallback.query_indices],
+                    fallback,
+                    **_gqa_disabled_kwargs(ctx, ops),
+                )
                 out = mx.concatenate((out, rest), axis=0)[plan.restore_indices]
             # Finish this lane before building the next layer. Otherwise MLX
             # can keep several materialized K/V pairs in flight, multiplying
@@ -953,43 +1107,47 @@ def sdpa_forward(
             mx.synchronize()
             del k16, v16
     else:
-        # Whole-batch decode routing belongs to the ordinary cache path. TQ
-        # uses its own sub-batch metadata and stays outside native decode split.
         paged_kwargs: dict[str, Any] = dict(mm_kwargs)
-        if ctx.paged_native_capabilities is None:
-            ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+        paged_kwargs.update(_whole_batch_decode_routing_kwargs(ctx, q_3d.shape[0], ops))
         capabilities = ctx.paged_native_capabilities
-        # Omit the new keyword on the default path for older native builds.
-        if ctx.gqa_disabled:
-            if capabilities["gqa_disable"]:
-                paged_kwargs["gqa_disabled"] = True
-            elif capabilities["gqa_decode"]:
-                # Never silently ignore a kill switch on an unrecognized GQA build.
-                raise RuntimeError(
-                    "Loaded native GQA build does not advertise disable support; "
-                    "rebuild the vllm-metal native extension."
-                )
-            # Pre-GQA native builds already use the established attention path.
-        if capabilities["decode_routing_metadata"]:
+        num_decode = ctx.num_decode_requests
+        if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
+            # Prefill batch: pick the NAX pipeline from per-sequence lengths
+            # the kernel dispatcher could only read back from the GPU.
+            # Native alone decides whether to split off ordinary decode rows.
+            work = prefill_work = None
+            if (
+                ctx.cu_seqlens is not None
+                and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
+                and ctx.cu_seqlens[-1] == q_3d.shape[0]
+            ):
+                if ctx.nax_tile_work is None:
+                    ctx.nax_tile_work = {}
+
+                def tile_work(first_seq: int):
+                    key = (layer_sliding_window, first_seq)
+                    if key not in ctx.nax_tile_work:
+                        ctx.nax_tile_work[key] = nax_tile_work(
+                            ctx.cu_seqlens[first_seq:],
+                            ctx.context_lens[first_seq:],
+                            layer_sliding_window,
+                        )
+                    return ctx.nax_tile_work[key]
+
+                work = tile_work(0)
+                if (
+                    capabilities["nax_prefill_split_hint"]
+                    and 0 < num_decode < len(ctx.context_lens)
+                    and num_decode == ctx.num_decode_tokens
+                    and ctx.verify_window_q == 1
+                ):
+                    prefill_work = tile_work(num_decode)
             paged_kwargs.update(
-                num_decode_requests=ctx.num_decode_requests,
-                num_decode_tokens=ctx.num_decode_tokens,
-                max_decode_context_len=ctx.max_decode_context_len,
+                nax_split_kwargs(
+                    capabilities, work, q_3d.shape[2], prefill_work=prefill_work
+                )
             )
-        if (
-            capabilities["gqa_length_plan"]
-            and not ctx.gqa_disabled
-            and ctx.num_decode_requests > 1
-            and ctx.num_decode_requests
-            == ctx.num_decode_tokens
-            == q_3d.shape[0]
-            == len(ctx.context_lens)
-            and ctx.verify_window_q == 1
-        ):
-            if ctx.gqa_length_plan is None:
-                ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
-            paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
-        ops.paged_attention_primitive(
+        out = ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,
             kernel_v_cache,
@@ -1002,7 +1160,6 @@ def sdpa_forward(
             kernel_block_size,
             max_seq_len,
             layer_sliding_window,
-            out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
             **paged_kwargs,
@@ -1031,8 +1188,18 @@ def sdpa_forward(
 
     # Reshape + strip padding back to actual head_dim before o_proj.
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
+    # The kernel returns the cache dtype. MLX promotes bfloat16 with float16
+    # to float32, so a float16 checkpoint with a bfloat16 cache would
+    # otherwise carry a float32 residual stream.
+    if out.dtype != attention_output_dtype:
+        out = out.astype(attention_output_dtype)
     if gate is not None:
-        out = out * mx.sigmoid(gate)
+        if attention_contract.sigmoid_output_gate == "per_head":
+            # Packed leading axes are (1, T); only split/rejoin the head channels.
+            out = mx.unflatten(out, -1, (n_heads, actual_head_dim))
+            out = (out * mx.sigmoid(gate)[..., None]).flatten(-2)
+        else:
+            out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
     return _output_projection(inner)(out), kv_for_sharing
 

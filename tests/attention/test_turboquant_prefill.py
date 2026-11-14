@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
 
 from tools.benchmark.tq_prefill_case import build_case
@@ -142,6 +142,7 @@ def test_prefill_quantization_formats(
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
     assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
+    assert kwargs["nax_split_hint"] == 0  # Two full Q blocks retain the original loop.
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
@@ -165,6 +166,7 @@ def test_prefill_strided_translated_pages(
     assert_parity(case)
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
+    assert kwargs["nax_split_hint"] == 1
     kb = args[9]
     # Only ceil(valid KV / kernel block) pages, even if the scheduler page
     # contains many unused sub-blocks and the input table has spare capacity.
@@ -196,6 +198,36 @@ def test_mixed_batch_routes_and_restores_rows(recorded_ops, prefill_backend):
     # long decode's 4097 tokens nor its rectangular padding is materialized.
     assert prefill[0][1].shape[0] == 24 + 41 - 16
     assert prefill[0][6][0, 0].item() == prefill[0][6][1, 0].item()
+
+
+@pytest.mark.parametrize("gqa_disabled", [False, True])
+def test_lone_decode_fallback_honours_the_gqa_kill_switch(
+    recorded_ops, monkeypatch, gqa_disabled
+):
+    """A decode row left compressed beside a prefill is a one-request decode
+    call, which native GQA would admit unless the kill switch reaches it."""
+    monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(gqa_disabled)))
+    case = build_case(
+        qlens=(1, 128), context_lens=(4097, 384), n_heads=16, n_kv_heads=2
+    )
+    case.ctx.num_decode_requests = 1
+    case.ctx.num_decode_tokens = 1
+    case.ctx.max_decode_context_len = 4097
+    assert_parity(case)
+    prefill, fallback = recorded_ops
+    assert not prefill[1].get("use_turboquant", False)
+    assert fallback[1]["use_turboquant"]
+    assert fallback[0][7].tolist() == [4097]
+    assert fallback[1].get("gqa_disabled", False) is gqa_disabled
+
+
+def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
+    """The compressed short request must not suppress the full prefill blocks."""
+    case = build_case(qlens=(256, 63), context_lens=(257, 2111))
+    assert_parity(case)
+    prefill = [kw for _, kw in recorded_ops if not kw.get("use_turboquant", False)]
+    assert len(prefill) == 1
+    assert prefill[0]["nax_split_hint"] == 1
 
 
 @pytest.mark.parametrize("qlen", [1, 2, 32, 127, 128])

@@ -15,7 +15,7 @@ from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
-from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+from vllm_metal.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.block_draft_paged import BlockDraftPagedCache
 from vllm_metal.v1.dflash import DFlashModel, DFlashTargetCapture
@@ -256,15 +256,23 @@ class BlockDraftProposer(ABC):
             ctx.decode_reqs,
             ctx.decode_token_ids,
             ctx.prefill_reqs,
+            ctx.prefill_token_ids,
             ctx.prefill_result_modes,
             ctx.request_states,
         )
-        req_ids, anchors, rows = [], [], []
+        req_ids, anchors, rows, limits = [], [], [], []
         if width:
             for req_id, state in eligible:
                 # This stage does not qualify scheduler-invalid grammar drafts.
                 # Keep constrained requests on the target's grammar sampler.
                 if state.sampling_params.structured_outputs is not None:
+                    continue
+                limit = width
+                max_tokens = state.sampling_params.max_tokens
+                if max_tokens is not None:
+                    # Verification also emits a correction or bonus token.
+                    limit = min(limit, max_tokens - state.generated_tokens - 1)
+                if limit < 1:
                     continue
                 # A fresh hit may already be beyond the draft's context
                 # limit and have no local coverage entry. It remains a
@@ -279,14 +287,20 @@ class BlockDraftProposer(ABC):
                 req_ids.append(req_id)
                 anchors.append(state.token_ids[-1])
                 rows.append((state.block_ids[self._group_index], end))
+                limits.append(limit)
         if not rows:
             mx.eval(*cache.storage.buffers)
             return None
-        # The scheduler selects the next width from its batch-size schedule.
-        # Keep a compiled callable for each encountered nonzero width. K=0
-        # still commits features above, so later drafting needs no replay.
+        # Keep one rectangular draft batch, bounded by its largest remaining
+        # budget. Shorter requests return only the prefix they can verify.
+        width = max(limits)
         if width not in self._drafts:
             self._drafts[width] = self._compile_draft(width)
         tokens = self._drafts[width](mx.array(anchors, dtype=mx.int32), rows)
         mx.eval(tokens, *cache.storage.buffers)
-        return DraftTokenIds(req_ids=req_ids, draft_token_ids=tokens.tolist())
+        return DraftTokenIds(
+            req_ids=req_ids,
+            draft_token_ids=[
+                ids[:limit] for ids, limit in zip(tokens.tolist(), limits, strict=True)
+            ],
+        )

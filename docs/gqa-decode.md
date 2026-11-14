@@ -22,7 +22,8 @@ best efficiency; this implementation does not adopt its wave-efficiency model.
 The supported `(query heads, KV heads, head dimension)` geometries are
 `(32,8,128)`, `(24,4,256)`, `(16,2,128)`, and `(16,2,256)`.
 Kernel block16 is supported for each; block32 is additionally supported for
-`(16,2,256)`. The existing scope is not inferred from a model-name list.
+`(24,4,256)` and `(16,2,256)`. The existing scope is not inferred from a model-name
+list.
 Geometry and kernel-page admission are checked at the native dispatch gate
 before occupancy planning, including when a private test forces a partition.
 One C++ table owns this domain. Numerical and routing tests read that table
@@ -103,13 +104,13 @@ Its optional `gpu_arch` is a read-only simulation input; it cannot change
 actual dispatch. `max_seq_len` optionally supplies an allocation upper bound.
 These queries check geometry, work and the scratch budget, not all dispatch
 conditions. Direct primitive callers can pass `gqa_length_plan` from
-`gqa_decode_length_plan(context_lens)`, or the original `gqa_context_lens` list;
-the two inputs are mutually exclusive and must agree with GPU `seq_lens`.
+`gqa_decode_length_plan(context_lens)`; it must agree with GPU `seq_lens`.
 
-Kernel block size is the view after hybrid-cache translation: a 1056-token
-scheduler page selects block32, while a 784- or 528-token page selects
-block16. Translated page IDs address their kernel-sized subpages even when
-upstream K/V storage remains unreshaped.
+Kernel block size is the view after hybrid-cache translation. The largest
+supported size that evenly divides the scheduler page is selected: an 800- or
+1056-token page selects block32, while a 784- or 528-token page selects block16.
+Translated page IDs address their kernel-sized subpages even when upstream
+K/V storage remains unreshaped.
 
 The GQA producer walks pages rather than tokens. Lane 0 preloads the next
 valid block-table entry and `simd_shuffle` broadcasts it within each SIMD
@@ -125,27 +126,38 @@ the GQA producer does not require a separate reduction algorithm.
 
 Every eligible call additionally requires:
 
-- A pure-decode batch with exactly one query row per request. One request
-  retains the existing `num_decode_requests=1` or omitted-count convention.
-  Multiple requests require matching `num_decode_requests` and
-  `num_decode_tokens`, plus their CPU `gqa_context_lens` metadata.
+- Ordinary decode rows with exactly one query row per request: either a
+  whole pure-decode batch, or the leading decode rows that the native split
+  separates from a mixed batch (see below). One request in a pure-decode
+  batch retains the existing `num_decode_requests=1` or omitted-count
+  convention. Multiple requests require matching `num_decode_requests` and
+  `num_decode_tokens`, plus their CPU `gqa_length_plan` metadata. A mixed-batch
+  decode prefix requires a plan describing exactly its rows.
 - A verification window of at most 1.
-- Matching FP16/BF16 query, key-cache and value-cache types.
-- At most **512 MiB total GQA scratch per attention call**, including all
-  rectangular padding: `B * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)`
-  bytes for the FP16/BF16 partial output and two FP32 statistics. Larger calls
-  fall back before allocation. This ceiling covers the measured serving
-  windows; it is not a reservation or a bound on total process memory.
+- Matching FP16/BF16 query, key-cache and value-cache types, or an FP16/BF16
+  query over a TurboQuant cache (int8/uint8 K, packed uint8 V). TurboQuant
+  takes the same work budget but only P256: its producer measured faster at
+  P256 than P512 below 64K tokens on M5 and M1 Max. A TurboQuant decode batch
+  reaches this path only as a whole batch; the compressed fallback rows of a
+  bounded TurboQuant prefill keep the established kernels.
+- At most **512 MiB total GQA scratch per attention call**. With multi-request
+  length metadata, padded rows use compact scratch:
+  `Q * sum(ceil(length_i / P)) * (2 * head_dim + 8) + 8 * (B + 1)` bytes for
+  the FP16/BF16 partial output, two FP32 statistics and INT64 partition offsets.
+  Calls with no padding or no multi-request metadata retain the rectangular layout:
+  `B * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)` bytes.
+  Larger calls fall back before allocation. This ceiling covers the measured
+  serving windows; it is not a reservation or a bound on total process memory.
 - A kernel page size allowed above and sufficient reducer shared memory:
   aligned dynamic statistics plus the compiled pipeline's static allocation.
   This is checked before allocating GQA scratch or encoding the producer;
   an oversized `max_seq_len` allocation bound falls back even when the actual
   KV lengths pass the work budget. The reducer reuses the checked pipeline.
-- No TurboQuant, attention sinks, logit soft-capping or sliding window.
+- No attention sinks, logit soft-capping or sliding window.
 - A known, positive GPU core count.
 
-Other calls, including mixed batches, missing batch lengths, expanded
-verification rows and unknown core counts, use the
+Other calls, including mixed batches without a decode-prefix plan, missing
+batch lengths, expanded verification rows and unknown core counts, use the
 established attention family. Model context limits, cache capacity and
 primitive resource limits still apply. The 16/4/256 geometry remains
 excluded from default routing.
@@ -184,16 +196,32 @@ The primitive captures its own copy and includes it in lazy-node equivalence.
 Direct callers must supply lengths consistent with `seq_lens`; shape and
 positive-length bounds are checked eagerly, without reading GPU array data.
 
-All requests use the same chosen partition. Scratch uses the maximum number
-of partitions as its row stride. Each producer skips partitions beyond its
-own KV length, and each reducer reads only that request's valid partials.
-Neither padding nor stale scratch from a shorter row contributes to its result.
+All requests use the same chosen partition. The CPU length plan also captures
+per-request partition offsets for P256/P512, shared immutably across layers.
+When rows would need padding, the producer and reducer address tightly packed
+per-request partials using these offsets. Rows that all fill the dispatch stride
+retain their existing layout without an offset buffer. The producer grid and
+reducer shared memory remain sized by the maximum partition count; each producer still skips
+partitions beyond its own KV length, and each reducer reads only that request's
+valid partials in the same order. Compact scratch saves allocation space without
+changing partition selection or removing empty producer workgroups.
 
-Mixed-batch integration must use an explicit decode sub-batch: active decode
-request count, query/output row mapping, KV lengths and page-table mapping.
-The whole batch count is not the decode count. Until that integration has its
-own validation, mixed batches use their existing routes, including #851's
-split where applicable. Removing the single-request guard alone is insufficient.
+Mixed batches use an explicit decode sub-batch. The native split separates the
+leading ordinary decode rows from the prefill kernel (#851 for tiled prefill,
+and NAX on M5) when the batch carries decode metadata and the decode rows hold
+at least 512 tokens of KV work. `sdpa_forward` passes a `GqaDecodeLengthPlan`
+built from only those rows' context lengths (capability
+`gqa_mixed_decode_plan`); the work is the plan's exact sum of those lengths.
+Without a plan, the longest decode row stands in for it as a lower bound. The
+prefix call then treats rows and sequences `0..D-1` as a pure decode batch: the
+GQA grid, reducer and scratch use `D` requests and the plan's maximum length,
+not the batch-wide count or `max_seq_len`. Without that plan, or with GQA
+disabled, the prefix keeps the per-token kernel, whose split-KV partitions are
+likewise bounded by `max_decode_context_len` rather than `max_seq_len` (which
+also covers the prefill rows and may be an allocation bound). Admission counts
+only the decode rows: a long prefill chunk never admits a short decode prefix.
+The binding rejects a prefix plan whose request count differs from the decode
+rows or whose maximum exceeds `max_decode_context_len`.
 
 ## Validation
 
@@ -231,8 +259,14 @@ translated scheduler pages, lazy writes, metadata lifetime and excluded routes.
 `tests/test_gqa_m3_policy.py` checks fixed device/page boundaries, unchanged
 single-request and other-device decisions, the reducer allocation limit and
 executed numerical results while lazy batches change membership and partition.
-The Python tests also keep mixed prefill and expanded verification metadata
-out of batch planning.
+The Python tests keep expanded verification metadata out of batch planning
+and pass only the decode prefix of a mixed batch, regenerating the plan when
+a later forward changes decode membership, order or lengths. Mixed-prefix
+tests pin the GPU core count and require decode rows bit-identical to the
+same rows as a pure GQA decode batch and prefill rows bit-identical to the
+unsplit prefill kernel, for representative geometries, both cache dtypes and
+translated scheduler pages; a short decode row next to a long prefill stays
+per-token, and an allocation-wide `max_seq_len` does not size the prefix.
 
 Default-policy positive route tests need a GPU core count and a sufficient
 partition grid. Hosts whose IORegistry does not report cores inject a
@@ -300,18 +334,26 @@ enablement or performance claims of this two-tier routing policy:
 1. **GQA without split-KV:** evaluate a grouped kernel that writes its final
    output directly, independently of context partitioning. Measure its
    tradeoff against P256/P512 at larger batch sizes.
-2. **Mixed prefill/decode:** integrate with the decode prefix split by merged
-   [#851](https://github.com/vllm-project/vllm-metal/pull/851), after validating
-   multi-request decode. Preserve row offsets, page tables and the prefill
-   path; benchmark continuous batching rather than inferring its benefit
-   from isolated decode. The integration point is clear, but correctness
-   and admission need their own tests.
-3. **TurboQuant decode:** evaluate consuming packed KV/scales in the GQA
-   kernel. This could complement the prefill optimization in
-   [#853](https://github.com/vllm-project/vllm-metal/pull/853), which now handles
-   bounded TurboQuant prefill. Avoid assuming that materializing the whole
-   history on every decode step is cheap; validate format, memory and quality
-   effects.
+2. **Mixed prefill/decode:** the decode prefix split by
+   [#851](https://github.com/vllm-project/vllm-metal/pull/851) (and its NAX
+   counterpart) now uses GQA through a decode-prefix length plan (see the
+   mixed-batch paragraph above). The tiled-era 4096-token context threshold
+   for that split is now a 512-token decode-work floor (the sum of the decode
+   rows' context lengths): on M5, many short decode rows gain the most from
+   the split, while a single 256-token row next to a short NAX prefill was
+   slower split (`tools/benchmark/mixed_decode_split_benchmark.py`). M1 Max
+   kernel and serving measurements on the tiled route agree with the floor.
+   The native split's overhead at short prefills remains: fixing it would let
+   the floor come down.
+3. **TurboQuant decode:** `paged_attention_gqa_decode_tq` reads packed K/V
+   and their scales in place, dequantizing each lane's slice in registers with
+   no per-step materialization of the history. Its partials stay in the
+   rotated V domain, and the TurboQuant reduce applies the single inverse FWHT,
+   as the split-KV TurboQuant path does. Default routing admits it under the
+   P256 work budget (see the eligibility list above). On M1 Max the budget
+   leaves some short-context head256 shapes on the established kernels even
+   though the producer is faster there; a TurboQuant-specific budget could
+   admit them. `tools/benchmark/tq_gqa_decode_benchmark.py` times the kernels.
 4. **Sliding windows:** bound loads and split selection by the actual visible
    KV window. This is relevant to Gemma/Mistral-style attention, but their
    geometries and other features such as sinks or soft-capping must also

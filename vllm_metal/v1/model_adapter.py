@@ -98,8 +98,6 @@ def _gemma4_text_only_reason(model_config: Any, speculative_config: Any) -> str 
     hf_config = getattr(model_config, "hf_config", None)
     if speculative_config is not None:
         return "speculative decoding is configured; vision needs a plain decode path"
-    if getattr(model_config, "quantization", None) == "gguf":
-        return "vision needs a safetensors checkpoint (GGUF)"
     quantization_config = getattr(hf_config, "quantization_config", None)
     quant_method = (
         quantization_config.get("quant_method")
@@ -180,6 +178,13 @@ class MultimodalRuntimeAdapter(Protocol):
       encoder profiling): one feature of the largest encoder input, which
       ``MetalModelRunner.profile_run`` encodes so the measured allocator
       overhead covers the vision tower.
+    - ``lora_weights_mapper: WeightsMapper`` (default ``None``): rewrites PEFT
+      adapter module names from the HF checkpoint layout to the names of the
+      wrapped MLX modules. Without it the LoRA manager maps the HF text-model
+      prefix onto the wrapped tree (``peft_loader.default_weights_mapper``).
+    - ``lora_encoder_target() -> EncoderLoRATarget`` (default absent): the
+      vision tower and connector that ``--enable-tower-connector-lora``
+      adapts.  Without it the flag is rejected.
     - ``bidirectional_layer_kinds: frozenset[str]`` (default empty): the layer
       kinds (``"sliding"``, ``"full"``) on which the rows of an image block
       attend to the whole block, not only causally.  Gemma 4 sets
@@ -257,6 +262,11 @@ class MultimodalRuntimeAdapter(Protocol):
 
 class ModelAdapter(Protocol):
     """Model-specific hooks used by runner and cache orchestration."""
+
+    def generation_model_provider(
+        self, hf_config: Any, *, is_multimodal: bool
+    ) -> Literal["mlx-lm", "mlx-vlm"]:
+        """Choose model definitions independently of accepted input modalities."""
 
     def multimodal_backbone_mode(
         self, model_config: ModelConfig, *, speculative_config: Any | None = None
@@ -384,13 +394,10 @@ class ModelAdapter(Protocol):
 
 # Models/configs that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
-# Qwen3.5/Qwen3.6 conditional-generation wrappers expose a multimodal config,
-# but only the FP8 and adapter-less variants are forced onto the text backbone:
-# FP8 checkpoints ship `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5
-# loader does not currently sanitize, while mlx_lm's qwen3_5 text loader handles
-# them; the MoE / Qwen3.6 wrappers have no multimodal adapter yet. Non-FP8
-# Qwen3.5 dense checkpoints keep the native multimodal path (see
-# `_matches_auto_text_backbone_override`).
+# muse_glimmer: no multimodal adapter, so image requests must stop at the frontend.
+# Qwen3.5/Qwen3.6 wrappers expose a multimodal config. FP8 stays on mlx_lm
+# because mlx-vlm does not sanitize `*_weight_scale_inv`; other wrappers stay
+# native only when an adapter supports them.
 _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "Qwen3_5ForConditionalGeneration",
@@ -399,10 +406,22 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3_6MoeForConditionalGeneration",
     }
 )
-_QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
+# Mistral 3 text models that mlx_lm's mistral3 wrapper loads. mistral4 text is
+# MLA, which that wrapper does not load, so it keeps the native path.
+_MISTRAL3_TEXT_BACKBONE_TEXT_TYPES: frozenset[str] = frozenset(
+    {"mistral", "ministral3"}
+)
+_TEXT_BACKBONE_OVERRIDE_MODEL_TYPES: frozenset[str] = _GEMMA4_MODEL_TYPES | {
+    "muse_glimmer"
+}
+# mlx-vlm's qwen3_5_moe shares qwen3_5's multimodal adapter contract.
+_QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset(
+    {"qwen3_5", "qwen3_5_moe", "qwen3_vl"}
+)
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
     }
 )
@@ -410,10 +429,27 @@ _PADDLEOCR_VL_MODEL_TYPES: frozenset[str] = frozenset({"paddleocr_vl"})
 _PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {"PaddleOCRVLForConditionalGeneration"}
 )
+# Both spellings are in the wild: Transformers registers ``lfm2_vl`` and the
+# LFM2.5-VL-3B and 1.6B checkpoints use it, while the 450M MLX conversions
+# declare ``lfm2-vl``.  Transformers rejects the hyphen, so those checkpoints
+# fail before this dispatch, but accept it here so the set describes the
+# family rather than one conversion.
+_LFM2_VL_MODEL_TYPES: frozenset[str] = frozenset({"lfm2_vl", "lfm2-vl"})
+_LFM2_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm2VlForConditionalGeneration"})
+# d1 checkpoints also declare ``lfm3_vl`` but add decision heads, so match the
+# generative architecture only.
+_LFM3_VL_ARCHITECTURES: frozenset[str] = frozenset({"Lfm3VlForConditionalGeneration"})
 
 
 class DefaultModelAdapter(ModelAdapter):
     """Default adapter implementation for known model quirks."""
+
+    def generation_model_provider(
+        self, hf_config: Any, *, is_multimodal: bool
+    ) -> Literal["mlx-lm", "mlx-vlm"]:
+        if is_multimodal or getattr(hf_config, "model_type", None) == "lfm3":
+            return "mlx-vlm"
+        return "mlx-lm"
 
     def _multimodal_mode(self) -> str:
         from vllm_metal.config import get_config
@@ -425,6 +461,10 @@ class DefaultModelAdapter(ModelAdapter):
 
         Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
+
+        Mistral 3 and Muse Glimmer: no multimodal adapter yet. The text backbone
+        clears ``multimodal_config``, so the frontend rejects image input
+        instead of the runner raising on it.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
         marked multimodal even when served text-only, and the FP8 family fails
@@ -438,8 +478,12 @@ class DefaultModelAdapter(ModelAdapter):
             return False
 
         model_type_from_hf = hf_config.model_type
-        if model_type_from_hf in _GEMMA4_MODEL_TYPES:
+        if model_type_from_hf in _TEXT_BACKBONE_OVERRIDE_MODEL_TYPES:
             return True
+        if model_type_from_hf == "mistral3":
+            text_config = getattr(hf_config, "text_config", None)
+            text_type = getattr(text_config, "model_type", None)
+            return text_type in _MISTRAL3_TEXT_BACKBONE_TEXT_TYPES
 
         architectures_from_hf = tuple(hf_config.architectures or ())
         has_text_backbone_architecture = any(
@@ -452,10 +496,7 @@ class DefaultModelAdapter(ModelAdapter):
         if self._has_fp8_quantization_config(hf_config):
             return True
 
-        # MLX affine wrappers only keep the native path when
-        # `build_multimodal_adapter` actually has an adapter for them. The MoE
-        # and Qwen3.6 wrappers do not, and an image request against a missing
-        # adapter raises in the runner, so they stay on the text backbone.
+        # MLX affine wrappers stay native only when their family has an adapter.
         return self._has_mlx_quantized_weights(
             hf_config
         ) and not self._is_qwen3_vl_family(hf_config)
@@ -504,6 +545,9 @@ class DefaultModelAdapter(ModelAdapter):
             return "text_only"
         if mode_env == "multimodal-native":
             return "native"
+        # A .gguf carries only the text model; mmproj weights ship as their own file.
+        if model_config.quantization == "gguf":
+            return "text_only"
         if getattr(hf_config, "model_type", None) not in _GEMMA4_MODEL_TYPES:
             return (
                 "text_only" if self.should_force_text_backbone(hf_config) else "native"
@@ -552,8 +596,9 @@ class DefaultModelAdapter(ModelAdapter):
         that the compatibility path intentionally bypasses; clearing it makes
         ``is_multimodal_model`` ``False`` so the input processor skips that
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
-        kept but restricted to images only, so the frontend rejects video
-        and audio inputs the sidecar cannot serve. ``native`` leaves the
+        kept but audio is turned off unless the checkpoint has an audio
+        encoder, and video is turned off on prefix-LM checkpoints, so the
+        frontend rejects inputs the sidecar cannot serve. ``native`` leaves the
         config untouched. :meth:`multimodal_backbone_mode` is the single
         source of truth for which mode applies.
         """
@@ -574,22 +619,41 @@ class DefaultModelAdapter(ModelAdapter):
             )
             return
         if mode == "text_sidecar":
-            self._restrict_to_images(model_config.multimodal_config)
+            # Only E2B/E4B carry an audio encoder; the processor and the
+            # sidecar both follow ``audio_config``.
+            keep_audio = getattr(hf_config, "audio_config", None) is not None
+            # Video frames go through the image tower. Prefix-LM checkpoints
+            # (26B/31B) disable chunked multimodal input, so a whole video
+            # (up to 32 frames of 70 soft tokens plus boi/eoi and a timestamp)
+            # would have to fit one prefill step; they stay image-only.
+            keep_video = not getattr(model_config, "is_mm_prefix_lm", False)
+            self._restrict_modalities(
+                model_config.multimodal_config,
+                keep_audio=keep_audio,
+                keep_video=keep_video,
+            )
             logger.info(
-                "Metal: Gemma 4 serves images through the vision sidecar on the "
-                "mlx_lm text backbone; video and audio inputs are refused"
+                "Metal: Gemma 4 encoder sidecar support: "
+                "image=True, audio=%s, video=%s",
+                keep_audio,
+                keep_video,
             )
 
     @staticmethod
-    def _restrict_to_images(multimodal_config: Any) -> None:
-        """Set video/audio limits to 0 so the frontend rejects them (idempotent)."""
+    def _restrict_modalities(
+        multimodal_config: Any, *, keep_audio: bool, keep_video: bool
+    ) -> None:
+        """Set the limits of modalities the sidecar cannot serve to 0 so the
+        frontend rejects them (idempotent)."""
         from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
 
+        refused: list[tuple[str, type]] = []
+        if not keep_video:
+            refused.append(("video", VideoDummyOptions))
+        if not keep_audio:
+            refused.append(("audio", AudioDummyOptions))
         limits = multimodal_config.limit_per_prompt
-        for modality, options_cls in (
-            ("video", VideoDummyOptions),
-            ("audio", AudioDummyOptions),
-        ):
+        for modality, options_cls in refused:
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(
@@ -768,12 +832,17 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         keep a model allowlist in sync with ``mlx_lm``, probe the loaded object
         for bit-exact agreement on one row.
 
-        Resolved once after load: the probe runs a cacheless forward, which is
-        only safe while no ``PagedAttentionContext`` is installed.
+        Resolved once after load, before any ``PagedAttentionContext`` is
+        installed. Models with a cache factory get independent empty caches
+        for the two forwards; their bare backbone may require cache metadata
+        even for the first token.
         """
         probe_ids = mx.zeros((1, 1), dtype=mx.int32)
         try:
-            reference = self.extract_logits(model(probe_ids, cache=None))
+            make_cache = getattr(self.text_model(model), "make_cache", None)
+            reference = self.extract_logits(
+                model(probe_ids, cache=make_cache() if make_cache is not None else None)
+            )
             hidden_states = self._forward_target_hidden_states(
                 model, probe_ids, cache=None
             )
@@ -829,6 +898,12 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 "Target hidden states require a text model with a `model` "
                 "backbone; this model output does not expose hidden states."
             )
+        if cache is None:
+            # Profiling and the head probe call the bare backbone without the
+            # full-model wrapper that normally supplies its native cache.
+            make_cache = getattr(self.text_model(model), "make_cache", None)
+            if make_cache is not None:
+                cache = make_cache()
         return backbone(input_ids, cache=cache)
 
     def _compute_target_logits(self, model: Any, hidden_states: mx.array) -> mx.array:
@@ -883,7 +958,17 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def _apply_target_logit_postprocessing(
         self, model: Any, logits: mx.array
     ) -> mx.array:
-        softcap = getattr(model, "final_logit_softcapping", None)
+        # Muse Glimmer scales its logits before the softcap, and mlx-lm keeps
+        # both values on ``args``.
+        args = getattr(model, "args", None)
+        multiplier = getattr(args, "output_multiplier", None)
+        if multiplier is not None:
+            logits = logits * multiplier
+        softcap = getattr(
+            model,
+            "final_logit_softcapping",
+            getattr(args, "final_logit_softcapping", None),
+        )
         if softcap is None:
             return logits
         return mx.tanh(logits / softcap) * softcap
@@ -935,7 +1020,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
             return cast(
                 MultimodalRuntimeAdapter,
-                Qwen3VLMultimodalAdapter.from_loaded_model(model),
+                Qwen3VLMultimodalAdapter.from_loaded_model(model, hf_config),
             )
 
         if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(
@@ -948,6 +1033,24 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return cast(
                 MultimodalRuntimeAdapter,
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
+            )
+
+        if any(arch in _LFM3_VL_ARCHITECTURES for arch in architectures):
+            from vllm_metal.multimodal.lfm3_vl import Lfm3VlMultimodalAdapter
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                Lfm3VlMultimodalAdapter.from_loaded_model(model),
+            )
+
+        if model_type in _LFM2_VL_MODEL_TYPES or any(
+            arch in _LFM2_VL_ARCHITECTURES for arch in architectures
+        ):
+            from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                Lfm2VlMultimodalAdapter.from_loaded_model(model),
             )
 
         return None

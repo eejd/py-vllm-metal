@@ -38,14 +38,7 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
-
-try:
-    from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "GGUF support requires the optional 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    ) from exc
+from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
 
 # qtypes executed from raw GGUF block bytes by the kernels below (#761).
 _RAW_KERNEL_BITS: dict[GGMLQuantizationType, int] = {
@@ -452,8 +445,8 @@ class GGUFRawBlockTensor:
         """Return a copy with output rows reordered by ``index`` (load-time).
 
         Every superblock is self-contained within its row, so gathering the
-        packed byte rows is bit-exact. Used to undo llama.cpp's RoPE weight
-        layout on q/k projections at load time.
+        packed byte rows is bit-exact. Used to undo llama.cpp's stored row
+        order at load time.
         """
         out_features = self.out_features
         if index.ndim != 1 or index.shape[0] != out_features:

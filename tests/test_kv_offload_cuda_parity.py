@@ -111,7 +111,12 @@ def test_scheduler_side_is_upstream_code() -> None:
     overridden = {
         name for name in vars(MetalOffloadingConnector) if not name.startswith("_")
     }
-    assert overridden == {"register_kv_caches"}, overridden
+    # The host pool methods are worker-side sleep hooks, not overrides.
+    assert overridden == {
+        "register_kv_caches",
+        "release_host_pool",
+        "restore_host_pool",
+    }, overridden
     for name in (
         "get_num_new_matched_tokens",
         "update_state_after_alloc",

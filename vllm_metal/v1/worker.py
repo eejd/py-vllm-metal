@@ -85,6 +85,7 @@ class MetalWorker(WorkerBase):
     # because its worker-facing method set is a superset of STTModelRunner's;
     # STT models are assigned an STTModelRunner at runtime (see init_device).
     model_runner: MetalModelRunner  # type: ignore[assignment]
+    _kv_cache_released = False
 
     def __init__(
         self,
@@ -113,6 +114,7 @@ class MetalWorker(WorkerBase):
             self.metal_config.k_quant = add.get("k_quant", "q8_0")
             self.metal_config.v_quant = add.get("v_quant", "q3_0")
             self.metal_config._validate_turboquant()
+        self.metal_config.apply_moe_expert_offload(add)
 
         # Disable custom all reduce (not supported on Metal)
         self.parallel_config.disable_custom_all_reduce = True
@@ -387,20 +389,41 @@ class MetalWorker(WorkerBase):
         return self.model_runner.get_draft_model_stats()
 
     def sleep(self, level: int = 1) -> None:
-        """Enter sleep mode (not supported on Metal).
-
-        Args:
-            level: Sleep level
+        """Free the KV cache. Weights already live in unified memory, so
+        level 1 keeps them in place instead of copying them to the CPU.
         """
-        logger.warning("Sleep mode is not supported on Metal, ignoring")
+        if level != 1:
+            raise NotImplementedError(
+                f"Metal supports sleep level 1 only, got {level}."
+            )
+        self.discard(("kv_cache",))
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        """Wake up from sleep mode (not supported on Metal).
+        # vLLM marks the KV cache as sleeping even when discard() raised, so
+        # restore only what was actually released.
+        if self._kv_cache_released and (tags is None or "kv_cache" in tags):
+            self.model_runner.restore_kv_cache_memory()
+            self._kv_cache_released = False
 
-        Args:
-            tags: Wake up tags
-        """
-        logger.warning("Sleep mode is not supported on Metal, ignoring")
+    def discard(self, tags: tuple[str, ...]) -> None:
+        if set(tags) != {"kv_cache"}:
+            raise NotImplementedError(
+                f"Metal can only discard the KV cache, got tags {tags}."
+            )
+        if not hasattr(self.model_runner, "release_kv_cache_memory"):
+            raise NotImplementedError(
+                f"Sleep mode is not supported with {type(self.model_runner).__name__}."
+            )
+        before = mx.get_active_memory()
+        self.model_runner.release_kv_cache_memory()
+        self._kv_cache_released = True
+        gc.collect()
+        mx.clear_cache()
+        logger.info(
+            "Sleep mode freed %.2f GiB; %.2f GiB of Metal memory is still in use.",
+            (before - mx.get_active_memory()) / (1 << 30),
+            mx.get_active_memory() / (1 << 30),
+        )
 
     def check_health(self) -> None:
         """Check worker health."""

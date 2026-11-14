@@ -39,18 +39,17 @@ jobs:
   parity:
     needs: resolve
     if: needs.resolve.outputs.run == 'true'
-    name: Parity (${{ matrix.os }}, ${{ matrix.model.name }})
-    runs-on: ${{ matrix.os }}
+    name: Parity (${{ matrix.model.name }})
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 45
     permissions:
       contents: read
     concurrency:
-      group: parity-${{ needs.resolve.outputs.key }}-${{ matrix.os }}-${{ matrix.model.name }}
+      group: parity-${{ needs.resolve.outputs.key }}-${{ matrix.model.name }}
       cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-26]
         model:
           - name: qwen3-0.6b
             id: Qwen/Qwen3-0.6B
@@ -59,9 +58,7 @@ jobs:
             id: Qwen/Qwen3.5-0.8B
             revision: 2fc06364715b967f1860aea9cf38778875588b17
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: '15.0'
-      # Use 0.65 on small GHA runners; 0.8 makes parity tests extremely slow.
       PARITY_GPU_MEMORY_UTILIZATION: '0.65'
       GLOO_SOCKET_IFNAME: lo0
       MODEL_ID: ${{ matrix.model.id }}
@@ -119,17 +116,34 @@ jobs:
           python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
             --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity" \
             --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Compare same-model speculative parity
+        if: matrix.model.name == 'qwen3-0.6b'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          python -m tools.check_parity --model "$MODEL_PATH" --draft "$MODEL_PATH" \
+            --method draft_model --num-draft-tokens 3 --top-k 5 --max-tokens 20 \
+            --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity/speculative" \
+            --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
+      - name: Check FP32 acceptance and rejection recovery
+        if: matrix.model.name == 'qwen3-0.6b'
+        run: |
+          source .venv-vllm-metal/bin/activate
+          uv pip install pytest
+          python -m pytest tests/test_draft_stats_e2e.py -k 'same_model_acceptance or controlled_rejection' \
+            -q -s --basetemp "$RUNNER_TEMP/parity/acceptance" \
+            --junitxml "$RUNNER_TEMP/parity/acceptance.xml"
       - name: Summarize parity
         if: always()
         run: |
-          printf '### %s\n\nCommit: %s\n\n' "$MODEL_ID" "$TESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f "$RUNNER_TEMP/parity/summary.md" ]; then
-            cat "$RUNNER_TEMP/parity/summary.md" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          if [ -x .venv-vllm-metal/bin/python ]; then
+            .venv-vllm-metal/bin/python .github/scripts/parity.py summary
+          else
+            printf '### %s\n\nCommit: %s\n\nEnvironment setup did not complete; parity results are unavailable.\n' "$MODEL_ID" "$TESTED_SHA"
+          fi >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
-          name: parity-${{ matrix.os }}-${{ matrix.model.name }}-${{ needs.resolve.outputs.sha }}
+          name: parity-${{ matrix.model.name }}-${{ needs.resolve.outputs.sha }}
           path: ${{ runner.temp }}/parity
           retention-days: 14
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A spy KV transfer group, for driving MetalKVConnector off-device."""
+"""A spy KV transfer group, for driving the runner's connector off-device."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 
 class SpyTransferGroup:
-    """Records the connector step lifecycle under ``MetalKVConnector``.
+    """Records the connector step lifecycle under MRv2's ``ActiveKVConnector``.
 
     Keeps upstream's invariant that a step's results are collected while its
     metadata is still bound; a step closed after the metadata was cleared
@@ -25,6 +25,13 @@ class SpyTransferGroup:
         self.finished_sending: set[str] | None = None
         self.finished_recving: set[str] | None = None
         self.invalid_block_ids: set[int] = set()
+        self.registered: list = []
+
+    def register_kv_caches(self, kv_caches) -> None:
+        self.registered.append(kv_caches)
+
+    def set_host_xfer_buffer_ops(self, copy_operation) -> None:
+        del copy_operation
 
     def handle_preemptions(self, metadata) -> None:
         del metadata

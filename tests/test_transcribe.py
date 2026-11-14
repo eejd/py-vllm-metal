@@ -153,6 +153,7 @@ class TestEncodePrompt:
         assert len(result) <= MAX_PROMPT_TOKENS + 1
 
 
+@pytest.mark.usefixtures("whisper_hub_tokenizer_cache")
 class TestTokenizerFallback:
     @pytest.mark.parametrize("n_vocab", [51864, 51865, 51866])
     @pytest.mark.parametrize("with_model_path", [False, True])

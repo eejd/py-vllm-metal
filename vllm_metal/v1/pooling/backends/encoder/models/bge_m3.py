@@ -12,7 +12,7 @@ import torch
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 
-from vllm_metal.pytorch_backend.tensor_bridge import (
+from vllm_metal.tensor_bridge import (
     TORCH_TO_MLX_DTYPE,
     mlx_to_torch,
 )
@@ -142,7 +142,6 @@ def load_bge_m3_backend(
     )
     return LoadedEncoderBackend(
         model=loaded_backbone.model,
-        tokenizer=loaded_backbone.tokenizer,
         model_args=loaded_backbone.model_args,
         pooling_backend=pooling_backend,
     )

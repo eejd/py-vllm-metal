@@ -12,6 +12,7 @@ import mlx.core as mx
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
+    from vllm_metal.attention.impls.gdn_spec import GDNSpecVerifyStep
 
 
 @functools.cache
@@ -49,6 +50,10 @@ class PagedStateCache:
         self.pending_conv_slot_ids = [None] * self.num_layers
         self.pending_recurrent_states = [None] * self.num_layers
         self.pending_recurrent_slot_ids = [None] * self.num_layers
+        # Verify-span activations staged for the post-verification state
+        # fixup (speculative decode on hybrid GDN models); None off the
+        # speculative path. Owned by gdn_spec, cleared every step.
+        self.spec_verify_stash: GDNSpecVerifyStep | None = None
 
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated conv pool, keeping pool siblings aliased."""
@@ -266,6 +271,13 @@ class PagedStateCache:
         arrays.extend(p for p in self.pending_conv_states if p is not None)
         arrays.extend(self.recurrent_states)
         arrays.extend(p for p in self.pending_recurrent_states if p is not None)
+        if self.spec_verify_stash is not None:
+            # Materialize compact gathers with the forward so they release
+            # their full-batch inputs before acceptance, even on full accept.
+            for layer in self.spec_verify_stash.layers:
+                arrays.extend(
+                    (layer.q, layer.k, layer.v, layer.g, layer.beta, layer.mixed_qkv)
+                )
         return arrays
 
     def _scatter_rows(self, pool: mx.array, rows: mx.array, ids: mx.array) -> mx.array:
@@ -325,6 +337,15 @@ class PagedStateCache:
         """Scatter all deferred recurrent updates into stable state pools."""
         for layer_idx in range(self.num_layers):
             self.apply_pending_recurrent_state(layer_idx)
+
+    def discard_pending_states(self) -> None:
+        for pending in (
+            self.pending_conv_states,
+            self.pending_conv_slot_ids,
+            self.pending_recurrent_states,
+            self.pending_recurrent_slot_ids,
+        ):
+            pending[:] = [None] * self.num_layers
 
     def apply_pending_states(self, slot_ids: Sequence[int] | None = None) -> None:
         """Flush pending components touching these slots, or all when omitted."""

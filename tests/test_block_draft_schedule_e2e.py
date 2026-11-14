@@ -5,6 +5,10 @@ import json
 
 import pytest
 
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
+)
 from tests.test_block_draft_serving_e2e import (
     DRAFT_MODELS,
     DRAFT_WIDTHS,
@@ -66,7 +70,6 @@ def _serve_scheduled(
         "injected_rejection": 0,
     }
     propose = proposer.propose
-    schedule = scheduler.schedule
     verify = runner._spec_decode_controller.verify_greedy
 
     def record_propose(ctx):
@@ -77,7 +80,12 @@ def _serve_scheduled(
         if width == 0:
             assert result is None
         elif result is not None:
-            assert all(len(tokens) == width for tokens in result.draft_token_ids)
+            for req_id, tokens in zip(
+                result.req_ids, result.draft_token_ids, strict=True
+            ):
+                state = ctx.request_states[req_id]
+                remaining = state.sampling_params.max_tokens - state.generated_tokens
+                assert len(tokens) == min(width, remaining - 1)
             if not stats["injected_rejection"]:
                 # Require a real rejection even when the trained checkpoint
                 # predicts this short workload perfectly. The replacement is
@@ -93,12 +101,6 @@ def _serve_scheduled(
                 stats["injected_rejection"] += 1
         return result
 
-    def record_schedule(*args, **kwargs):
-        result = schedule(*args, **kwargs)
-        stats["preemptions"] += len(result.preempted_req_ids)
-        stats["resumptions"] += len(result.scheduled_cached_reqs.resumed_req_ids)
-        return result
-
     def record_verify(logits, requests, segments):
         result = verify(logits, requests, segments)
         for segment, tokens in zip(segments, result, strict=True):
@@ -107,7 +109,8 @@ def _serve_scheduled(
         return result
 
     proposer.propose = record_propose
-    scheduler.schedule = record_schedule
+    assert_v2_model_runner(llm)
+    track_preemptions_and_resumptions(scheduler, stats)
     runner._spec_decode_controller.verify_greedy = record_verify
 
     def step_until(predicate):
@@ -161,7 +164,7 @@ def _serve_scheduled(
         assert {(max_width, 1), (1, 0), (0, 0), (0, 1), (1, max_width)} <= handoffs, (
             handoffs
         )
-        assert set(proposer._drafts) == {1, max_width}
+        assert {1, max_width} <= set(proposer._drafts) <= set(range(1, max_width + 1))
         assert free_blocks() == free
 
         # Resume speculation on freshly allocated pages under a cancelled ID.

@@ -1,6 +1,6 @@
 # Local patches (`local` branch)
 
-`local` = upstream release `v0.31.0` + the `topic/*` branches below (cherry-picked, `-x`).
+`local` = upstream release `v0.31.0` + the `topic/*` branches below (cherry-picked, `-x`); since the 2026-11-14 merge it also contains `v0.33.0`, with only `topic/gloo-loopback` applied on top (see `UPSTREAM.md`: `request-lifecycle` needs re-derivation, `gemma4-assistant-probe` is obsolete).
 It is the source of the MacPorts port `py-vllm-metal-local` (tag `v<base>-local<NN>`).
 `main` is a fast-forward mirror of `vllm-project/vllm-metal` `main` and is never edited; the topics
 are written against `main` and applied to the release base. Each topic is ONE upstreamable change
