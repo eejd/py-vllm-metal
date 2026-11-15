@@ -9,8 +9,9 @@ is preserved; set `VLLM_USE_V2_MODEL_RUNNER=0` to opt out on MLX. MPS requires V
 
 When the MLX runner's CPU sampler cannot compile its logprob rank helper
 (for example, because the C++ compiler cannot find OpenMP headers), it logs a
-warning and uses eager logprob gathering for the rest of that sampler's lifetime.
-Sampling is not repeated; unrelated runtime errors still propagate.
+warning and uses eager prompt and sampled-token logprob gathering for the rest
+of that sampler's lifetime. Sampling is not repeated; unrelated runtime errors
+still propagate.
 
 ## Environment Variables
 

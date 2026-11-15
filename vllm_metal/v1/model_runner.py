@@ -505,7 +505,7 @@ class MetalModelRunner:
 
         # Per-request prompt-logprobs accumulation across prefill chunks
         # (populated only for requests whose SamplingParams ask for it).
-        self._prompt_logprobs_tracker = PromptLogprobsTracker()
+        self._prompt_logprobs_tracker = PromptLogprobsTracker(self._sampler)
 
         # One-step-ahead decode pipelining (owner: decode_pipeline.py).
         # Gate-eligible pure-decode greedy steps defer the sampling sync one

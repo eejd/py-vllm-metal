@@ -7,6 +7,7 @@ import torch
 import vllm.v1.sample.sampler as upstream_sampler
 from vllm.sampling_params import SamplingParams
 
+from vllm_metal.v1.prompt_logprobs import PromptLogprobsTracker
 from vllm_metal.v1.sampling_batch import MetalSampler, SamplingBatch, sample_from_logits
 
 
@@ -51,3 +52,43 @@ def test_non_compile_errors_propagate(monkeypatch):
     sampler = MetalSampler()
     with pytest.raises(ValueError, match="real sampler error"):
         sampler.gather_logprobs(torch.zeros((1, 4)), 1, torch.tensor([0]))
+
+
+@pytest.mark.parametrize("prompt_first", [True, False])
+def test_prompt_logprobs_compile_failure_falls_back(monkeypatch, caplog, prompt_first):
+    attempts = []
+
+    def failing_backend(graph, inputs):
+        attempts.append(1)
+        raise RuntimeError("compiler unavailable")
+
+    compiled = torch.compile(lambda x, y: (x >= y).sum(dim=-1), backend=failing_backend)
+    monkeypatch.setattr(upstream_sampler, "batched_count_greater_than", compiled)
+    sampler = MetalSampler()
+    tracker = PromptLogprobsTracker(sampler)
+    batch = SamplingBatch(
+        [SamplingParams(temperature=0, logprobs=1)], [[1]], [[]], vocab_size=4
+    )
+
+    def prompt():
+        tracker.register("r", 1)
+        result = tracker.observe_chunk(
+            "r",
+            [0, 2],
+            0,
+            2,
+            mx.array([[0.0, 1.0, 4.0, 2.0], [0.0] * 4]),
+            "raw_logprobs",
+        )
+        assert result.selected_token_ranks.tolist() == [1]
+
+    def generated():
+        result = sample_from_logits(
+            mx.array([[0.0, 1.0, 4.0, 2.0]]), batch, sampler
+        )
+        assert result.logprobs.sampled_token_ranks.tolist() == [1]
+
+    for operation in (prompt, generated) if prompt_first else (generated, prompt):
+        operation()
+    assert len(attempts) == 1
+    assert caplog.text.count("falling back to eager") == 1
