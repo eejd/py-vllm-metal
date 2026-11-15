@@ -872,6 +872,9 @@ class TestMetalPlatform:
             MetalPlatform.check_and_update_config(self._dp_vllm_config())
             assert "GLOO_SOCKET_IFNAME" not in os.environ
 
+            # An operator value set after we installed the default is kept.
+            MetalPlatform.check_and_update_config(self._platform_config())
+            assert os.environ["GLOO_SOCKET_IFNAME"] == "lo0"
             os.environ["GLOO_SOCKET_IFNAME"] = "en0"
             MetalPlatform.check_and_update_config(self._dp_vllm_config())
             assert os.environ["GLOO_SOCKET_IFNAME"] == "en0"

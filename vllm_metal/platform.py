@@ -1158,7 +1158,9 @@ class MetalPlatform(Platform):
         elif not local_only and _gloo_loopback_installed:
             # An earlier single-process config in this process installed the
             # default; a topology that leaves the machine must not inherit it.
-            os.environ.pop("GLOO_SOCKET_IFNAME", None)
+            # A value the operator has set since is theirs and stays.
+            if os.environ.get("GLOO_SOCKET_IFNAME") == "lo0":
+                del os.environ["GLOO_SOCKET_IFNAME"]
             _gloo_loopback_installed = False
 
         # Log memory configuration

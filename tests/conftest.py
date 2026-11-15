@@ -187,8 +187,11 @@ def _restore_gloo_socket_ifname():
     """MetalPlatform.check_and_update_config pins GLOO_SOCKET_IFNAME for local
     serving; keep that process-wide side effect from leaking between tests."""
 
+    import vllm_metal.platform as metal_platform
+
     before = os.environ.get("GLOO_SOCKET_IFNAME")
     yield
+    metal_platform._gloo_loopback_installed = False
     if before is None:
         os.environ.pop("GLOO_SOCKET_IFNAME", None)
     else:
