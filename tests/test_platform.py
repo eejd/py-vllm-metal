@@ -847,6 +847,37 @@ class TestMetalPlatform:
 
         assert os.environ["GLOO_SOCKET_IFNAME"] == explicit
 
+    def test_data_parallel_config_drops_loopback_default_installed_earlier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A single-process config installs the loopback default; a later
+        # multi-process config in the same process must not inherit it, but an
+        # operator-chosen value is never removed.
+        monkeypatch.delenv("GLOO_SOCKET_IFNAME", raising=False)
+        monkeypatch.setattr(
+            sys.modules[MetalPlatform.__module__], "_gloo_loopback_installed", False
+        )
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        monkeypatch.setattr(
+            MetalPlatform,
+            "_register_dp_ray_worker_setup_hook",
+            classmethod(lambda cls, ray_runtime_env: None),
+        )
+        reset_config()
+        try:
+            MetalPlatform.check_and_update_config(self._platform_config())
+            assert os.environ["GLOO_SOCKET_IFNAME"] == "lo0"
+
+            MetalPlatform.check_and_update_config(self._dp_vllm_config())
+            assert "GLOO_SOCKET_IFNAME" not in os.environ
+
+            os.environ["GLOO_SOCKET_IFNAME"] = "en0"
+            MetalPlatform.check_and_update_config(self._dp_vllm_config())
+            assert os.environ["GLOO_SOCKET_IFNAME"] == "en0"
+        finally:
+            reset_config()
+
     def test_pipeline_parallel_config_leaves_gloo_interface_unset(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

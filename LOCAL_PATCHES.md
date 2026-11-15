@@ -1,6 +1,6 @@
 # Local patches (`local` branch)
 
-`local` = upstream release `v0.31.0` + the `topic/*` branches below (cherry-picked, `-x`); since the 2026-11-14 merge it also contains `v0.33.0`, with only `topic/gloo-loopback` applied on top (see `UPSTREAM.md`: `request-lifecycle` needs re-derivation, `gemma4-assistant-probe` is obsolete).
+`local` = upstream release `v0.33.0` (merged 2026-11-14) + the `topic/*` branches below. Two earlier topics are gone from this tree: `request-lifecycle` (superseded on v0.33.0; tip archived as tag `archive/topic-request-lifecycle-v0.31`) and `gemma4-assistant-probe` (obsolete; upstream deleted the shim). `v0.31.0-local02` and older tags still contain them. See `UPSTREAM.md`.
 It is the source of the MacPorts port `py-vllm-metal-local` (tag `v<base>-local<NN>`).
 `main` is a fast-forward mirror of `vllm-project/vllm-metal` `main` and is never edited; the topics
 are written against `main` and applied to the release base. Each topic is ONE upstreamable change
@@ -10,9 +10,7 @@ build overrides, dependency bounds relaxed to MacPorts versions) are NOT here: t
 
 | Behaviour | Topic | Files | Tests | Upstream |
 |---|---|---|---|---|
-| Exactly one `RequestState` per paged request, admitted before any forward; the final-prefill sample advances it once; cached steps classified by the scheduler's computed-token boundary (prompt continuation / resume recompute -> prefill, unknown scheduled position refused, metadata-only entries enqueue no work); `execute_model` refuses to start while a forward is unconsumed by `sample_tokens`; PP stage mirror never replaces an admitted state. Fixes the engine dying on a failed first structured-output sample under async scheduling. | `topic/request-lifecycle` | `vllm_metal/v1/model_runner.py` | `tests/test_runner_request_lifecycle.py` (new, 11 tests; 7 fail on v0.31.0 without the fix), `tests/test_v1_model_runner_generate.py`, `tests/v1/mm/test_paged_forward_mm.py` | not submitted (macports-ports-local#1196) |
 | `GLOO_SOCKET_IFNAME=lo0` for single-node, single-process serving (TP=PP=DP=1) when unset; explicit values (even empty) and every multi-process / multi-node topology untouched. Avoids gloo resolving the host name (tens of seconds, or a VPN tunnel). | `topic/gloo-loopback` | `vllm_metal/platform.py` | `tests/test_platform.py`, `tests/conftest.py` (env restore fixture), `tests/test_kv_offload_config.py` | not submitted (macports-ports-local#1196); related but different: upstream #633 sets `VLLM_HOST_IP` |
-| The `gemma4_assistant` compat probe treats huggingface_hub's `StrictDataclassError` (transformers 5.20 default-config validation) as "type known" instead of aborting `register()`, which made vLLM fall back to `CpuPlatform` | `topic/gemma4-assistant-probe` | `vllm_metal/compat.py` | `tests/test_compat.py` (`TestGemma4AssistantProbe`) | none yet |
 
 Rebasing: archive the old tip as `archive/local-pre-rebase-<sha>`, re-apply the topics on the new
 release base, keep these rows, run `pytest tests` (some tests need network: compare with the base).

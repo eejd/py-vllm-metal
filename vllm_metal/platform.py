@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# True while GLOO_SOCKET_IFNAME in this process holds the loopback default that
+# check_and_update_config installed (not a value the operator chose).
+_gloo_loopback_installed = False
+
 
 # Large command buffers cut per-step decode commit overhead but inflate the
 # transient profile peak that profile_run charges against the KV budget, so
@@ -1142,13 +1146,20 @@ class MetalPlatform(Platform):
         # explicit choice; multi-process and multi-node setups keep gloo's own
         # interface selection. Runs in the API-server process before the engine
         # child is created, so the child inherits it.
-        if (
+        global _gloo_loopback_installed
+        local_only = (
             parallel_config.tensor_parallel_size == 1
             and parallel_config.pipeline_parallel_size == 1
             and parallel_config.data_parallel_size == 1
-            and "GLOO_SOCKET_IFNAME" not in os.environ
-        ):
+        )
+        if local_only and "GLOO_SOCKET_IFNAME" not in os.environ:
             os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
+            _gloo_loopback_installed = True
+        elif not local_only and _gloo_loopback_installed:
+            # An earlier single-process config in this process installed the
+            # default; a topology that leaves the machine must not inherit it.
+            os.environ.pop("GLOO_SOCKET_IFNAME", None)
+            _gloo_loopback_installed = False
 
         # Log memory configuration
         total_mem = cls.get_device_total_memory()

@@ -11,13 +11,13 @@ None. (Commits adopted from other repos would be listed here with `Source: <repo
 
 | Topic | Upstream PR | Status |
 |---|---|---|
-| `topic/request-lifecycle` | none yet | not-submitted (found and soak-tested via macports-ports-local#1196; checked 2026-10-16 that upstream `main` @ `468b0c8` has no equivalent: the patch applies unchanged to `main` and to `v0.31.0`) |
+| `topic/request-lifecycle` | none yet | **dropped 2026-11-14, not in `local` since v0.33.0** (superseded; see below). Historical: not-submitted (found and soak-tested via macports-ports-local#1196; checked 2026-10-16 that upstream `main` @ `468b0c8` has no equivalent: the patch applies unchanged to `main` and to `v0.31.0`) |
 | `topic/gloo-loopback` | none yet | not-submitted (upstream #633 "Use loopback for default UniProc rendezvous" sets `VLLM_HOST_IP`, not `GLOO_SOCKET_IFNAME`; `main` only sets it in `tools/*.py`) |
-| `topic/gemma4-assistant-probe` | none yet | not-submitted (compat probe only catches ValueError; transformers 5.20 raises StrictDataclassError) |
+| `topic/gemma4-assistant-probe` | none yet | **dropped 2026-11-14, not in `local` since v0.33.0** (obsolete; see below). Historical: not-submitted (compat probe only catches ValueError; transformers 5.20 raises StrictDataclassError) |
 
 ## Origin
 
-Both topics were developed as `files/` patches of the MacPorts port `python/py-vllm-metal-devel`
+The first two topics were developed as `files/` patches of the MacPorts port `python/py-vllm-metal-devel`
 (`eejd/macports-ports-local`, patches `patch-runner-request-lifecycle.diff`,
 `patch-gloo-loopback-interface.diff`, `patch-runner-lifecycle-tests.diff`) and moved here on
 2026-10-16 (ADR-0008).
