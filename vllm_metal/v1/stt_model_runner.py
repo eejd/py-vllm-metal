@@ -28,7 +28,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.loader import resolve_model_path
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES, STT_SCHED_NOMINAL_HEAD_SIZE
@@ -36,6 +35,7 @@ from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.sampling import STTSampling
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.v1.model_lifecycle import load_stt_model
+from vllm_metal.v1.sampling_batch import MetalSampler
 
 logger = init_logger(__name__)
 
@@ -52,7 +52,7 @@ class STTModelRunner:
 
         self.model: Any = None
         self._stt_runtime_adapter: STTRuntimeAdapter | None = None
-        self._sampler = Sampler()
+        self._sampler = MetalSampler()
 
         # execute_model stashes the output here; sample_tokens returns it,
         # matching the engine's execute -> sample handoff.

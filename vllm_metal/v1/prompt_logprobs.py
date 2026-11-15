@@ -12,6 +12,7 @@ from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.sampling_batch import MetalSampler
 
 _LOGITS_LOGPROBS_MODES = ("raw_logits", "processed_logits")
 
@@ -79,9 +80,10 @@ class PromptLogprobsTracker:
     in-progress chunks across prompt-stage preemption.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sampler: MetalSampler | None = None) -> None:
         self._active: dict[str, int] = {}
         self._in_progress: dict[str, PromptLogprobsAccumulator] = {}
+        self._sampler = sampler if sampler is not None else MetalSampler()
 
     def register(self, req_id: str, num_logprobs: int) -> None:
         """Track one request until its prompt logprobs are delivered."""
@@ -133,6 +135,7 @@ class PromptLogprobsTracker:
                 targets,
                 accumulator.num_logprobs,
                 logprobs_mode=logprobs_mode,
+                sampler=self._sampler,
             )
             accumulator.fill(window, chunk)
         if not window.completes:
@@ -157,6 +160,8 @@ def gather_prompt_logprobs(
     target_token_ids: list[int],
     num_logprobs: int,
     logprobs_mode: str = "raw_logprobs",
+    *,
+    sampler: MetalSampler | None = None,
 ) -> LogprobsTensors:
     """Score ``target_token_ids`` against ``logits_rows`` (one row per target).
 
@@ -178,4 +183,6 @@ def gather_prompt_logprobs(
         else Sampler.compute_logprobs(logits)
     )
     targets = torch.tensor(target_token_ids, dtype=torch.int64)
-    return Sampler.gather_logprobs(scores, num_logprobs, targets)
+    return (sampler if sampler is not None else MetalSampler()).gather_logprobs(
+        scores, num_logprobs, targets
+    )

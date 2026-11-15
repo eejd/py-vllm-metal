@@ -46,7 +46,6 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     ActiveKVConnector,
@@ -126,6 +125,7 @@ from vllm_metal.v1.proposer import (
     ProposeContext,
 )
 from vllm_metal.v1.sampling_batch import (
+    MetalSampler,
     SamplingBatch,
     create_request_generator,
     native_sampling_key,
@@ -442,7 +442,7 @@ class MetalModelRunner:
 
         # vLLM Sampler for token sampling with temperature, top_k, top_p support.
         # It takes the configured logprobs mode, as vLLM's GPU runner does.
-        self._sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self._sampler = MetalSampler(logprobs_mode=self.model_config.logprobs_mode)
 
         self._draft_token_ids: DraftTokenIds | None = None
         # KV connector driver, built by register_kv_connector_caches.
@@ -505,7 +505,7 @@ class MetalModelRunner:
 
         # Per-request prompt-logprobs accumulation across prefill chunks
         # (populated only for requests whose SamplingParams ask for it).
-        self._prompt_logprobs_tracker = PromptLogprobsTracker()
+        self._prompt_logprobs_tracker = PromptLogprobsTracker(self._sampler)
 
         # One-step-ahead decode pipelining (owner: decode_pipeline.py).
         # Gate-eligible pure-decode greedy steps defer the sampling sync one
