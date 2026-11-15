@@ -104,8 +104,13 @@ class MetalKVOffloadWorker(OffloadingWorker):
         return True
 
     def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+        expedited: bool = False,
     ) -> bool:
+        # Transfers finish inside submission, so an expedited load never queues.
         if not isinstance(src_spec, CPULoadStoreSpec) or not isinstance(
             dst_spec, GPULoadStoreSpec
         ):
@@ -230,6 +235,14 @@ class MetalKVOffloadWorker(OffloadingWorker):
 
     def wait(self, job_ids: set[int]) -> None:
         pass  # transfers complete in submit_*
+
+    def release_host_pool(self) -> None:
+        if self.region is not None:
+            self.region.release_pages()
+
+    def restore_host_pool(self) -> None:
+        if self.region is not None:
+            self.region.reuse_pages()
 
     def shutdown(self) -> None:
         self._host.clear()

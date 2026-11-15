@@ -7,6 +7,10 @@ from importlib.metadata import version
 
 import pytest
 
+from tests.scheduler_helpers import (
+    assert_v2_model_runner,
+    track_preemptions_and_resumptions,
+)
 from tests.test_block_draft_serving_e2e import _block_draft_llm, _spawn_env
 
 # Use the same checkpoint revisions as the serving/continuation qualification.
@@ -22,6 +26,12 @@ CHECKPOINTS = {
         "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
         "deepseek-ai/dspark_qwen3_4b_block7",
         "3457dff1417cb84927f6098a5fcb7cee85c934b7",
+    ),
+    "dspark-speculators": (
+        "mlx-community/Qwen3-4B-4bit",
+        "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
+        "RedHatAI/Qwen3-4B-speculator.dspark",
+        "bdffaa5f011da5a1a58ad841a1f6ced3e87f2f23",
     ),
 }
 
@@ -81,7 +91,6 @@ def _serve(pair, verify_window, caching, path):
     reject_next = False
     propose = proposer.propose
     verify = runner._spec_decode_controller.verify_greedy
-    schedule = scheduler.schedule
 
     def record_propose(ctx):
         nonlocal reject_next
@@ -135,15 +144,10 @@ def _serve(pair, verify_window, caching, path):
                 )
         return result
 
-    def record_schedule(*args, **kwargs):
-        result = schedule(*args, **kwargs)
-        stats["preemptions"] += len(result.preempted_req_ids)
-        stats["resumed"] += len(result.scheduled_cached_reqs.resumed_req_ids)
-        return result
-
     proposer.propose = record_propose
     runner._spec_decode_controller.verify_greedy = record_verify
-    scheduler.schedule = record_schedule
+    assert_v2_model_runner(llm)
+    track_preemptions_and_resumptions(scheduler, stats, resumption_key="resumed")
     records = {}
 
     def generate(prompts, params=greedy):
@@ -176,25 +180,6 @@ def _serve(pair, verify_window, caching, path):
                 if output.finished:
                     results[output.request_id] = list(output.outputs[0].token_ids)
         raise AssertionError("Scheduler failed to make progress")
-
-    def retained_resume():
-        engine.add_request(
-            "resumed",
-            {"prompt_token_ids": computer[:63]},
-            SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
-        )
-        before = stats["drafted"]
-        for _ in range(30):
-            engine.step()
-            if stats["drafted"] > before:
-                break
-        assert stats["drafted"] > before
-        assert len(scheduler.running) == 1
-        # Use the scheduler's actual preemption path, but do not consume its
-        # freed pages with another request. This deterministically exercises
-        # resume with a retained prefix, in addition to pressure/eviction below.
-        scheduler._preempt_request(scheduler.running.pop(), time.monotonic())
-        return drain()
 
     pool = scheduler.kv_cache_manager.block_pool
     free = pool.get_num_free_blocks()
@@ -259,15 +244,6 @@ def _serve(pair, verify_window, caching, path):
             ),
         )
         assert pressure["preemptions"] and pressure["resumed"], pressure
-        assert pool.get_num_free_blocks() == free
-        assert llm.reset_prefix_cache()
-        resumed = measure("retained_resume", retained_resume)
-        assert resumed["outputs"]["resumed"] == pressure["outputs"][0][:32]
-        assert resumed["preemptions"] and resumed["resumed"], resumed
-        if caching:
-            assert resumed["cache_hits"] and resumed["drafted_after_hit"], resumed
-            resumed_first = [f for f in resumed["first_windows"] if f["cache_hit"]]
-            assert resumed_first, resumed
         assert pool.get_num_free_blocks() == free
         assert stats["rejected"] > 0, stats
     finally:

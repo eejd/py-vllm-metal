@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
 from vllm_metal.attention.block_tables import build_block_tables
@@ -62,8 +62,7 @@ class AttentionCase:
         def kernel_view(array):
             return array.reshape(-1, kb, c.num_kv_heads, array.shape[-1])
 
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             q,
             kernel_view(c.key_caches[0]),
             kernel_view(c.value_caches[0]),
@@ -76,7 +75,6 @@ class AttentionCase:
             kb,
             max(self.ctx.context_lens),
             c.sliding_window_per_layer[0],
-            out,
             use_turboquant=True,
             quant_type=c.k_quant,
             v_bits=c.v_bits,

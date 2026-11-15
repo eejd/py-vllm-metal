@@ -75,6 +75,18 @@ _AWQ_QUANTIZATION_CONFIG = {
     "zero_point": True,
     "version": "gemm",
 }
+_MLX_QUANTIZATION_CONFIG = {"group_size": 64, "bits": 4}
+_FP8_QUANTIZATION_CONFIG = {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": [128, 128],
+}
+
+# Config-building tests here name many architectures; inspect them in process
+# instead of one vLLM import each. The entry-point test below runs in its own
+# interpreter and so still exercises the real registry subprocess.
+pytestmark = pytest.mark.usefixtures("inspect_vllm_models_in_process")
 
 
 @pytest.fixture(autouse=True)
@@ -275,14 +287,72 @@ def test_explicit_non_gguf_quantization_fails_fast(gguf_file, config_dir) -> Non
         ).create_model_config()
 
 
-def test_non_gguf_model_is_untouched(config_dir) -> None:
-    # A plain HF directory flows through the wrap unmodified.
-    args = _engine_args(model=config_dir)
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {},
+        {
+            "quantization": _MLX_QUANTIZATION_CONFIG,
+            "quantization_config": _MLX_QUANTIZATION_CONFIG,
+        },
+    ],
+    ids=["unquantized", "mlx"],
+)
+def test_non_gguf_model_is_untouched(tmp_path, extra_config) -> None:
+    # A non-GGUF HF directory, quantized or not, flows through the wrap unmodified.
+    (tmp_path / "config.json").write_text(json.dumps({**_TINY_CONFIG, **extra_config}))
+    args = _engine_args(model=str(tmp_path))
     model_config = args.create_model_config()
 
-    assert args.model == config_dir
+    assert args.model == str(tmp_path)
     assert model_config.quantization is None
     assert model_config.model_weights == ""
+
+
+@pytest.mark.parametrize(
+    "quantization_keys",
+    [
+        {
+            "quantization": _MLX_QUANTIZATION_CONFIG,
+            "quantization_config": _MLX_QUANTIZATION_CONFIG,
+        },
+        {"quantization_config": _FP8_QUANTIZATION_CONFIG},
+        {"quantization_config": _AWQ_QUANTIZATION_CONFIG},
+    ],
+    ids=["mlx", "fp8", "awq"],
+)
+def test_quantized_config_source_routes_as_gguf(
+    gguf_file, tmp_path, quantization_keys
+) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({**_TINY_CONFIG, **quantization_keys})
+    )
+
+    vllm_config = _engine_args(
+        model=gguf_file, tokenizer=str(tmp_path)
+    ).create_engine_config()
+
+    assert vllm_config.model_config.quantization == "gguf"
+    assert vllm_config.model_config.model_weights == gguf_file
+
+
+def test_explicit_gguf_on_quantized_checkpoint_fails_at_load_source(
+    tmp_path,
+) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({**_TINY_CONFIG, "quantization_config": _AWQ_QUANTIZATION_CONFIG})
+    )
+    model_config = _engine_args(
+        model=str(tmp_path), quantization="gguf"
+    ).create_model_config()
+
+    with pytest.raises(ValueError) as excinfo:
+        gguf_source.GGUFLoadSource.from_model_config(model_config)
+
+    assert str(excinfo.value) == (
+        "GGUF model_config must carry a local .gguf path or remote "
+        "repo_id:quant reference in model_weights; got ''."
+    )
 
 
 @pytest.mark.parametrize("offline", [False, True])
@@ -324,10 +394,7 @@ def test_register_is_idempotent() -> None:
 
 
 def test_integration_imports_without_gguf_package(monkeypatch) -> None:
-    """Default-install tripwire: the entry-point module must import and
-    register with the optional ``gguf`` package absent (vLLM loads it on every
-    run).
-    """
+    """The entry point must register without eagerly importing GGUF parsing."""
     monkeypatch.setitem(sys.modules, "gguf", None)
     monkeypatch.delitem(sys.modules, "vllm_metal.gguf.vllm_integration", raising=False)
     monkeypatch.delitem(sys.modules, "vllm_metal.gguf.source", raising=False)
@@ -348,24 +415,6 @@ def test_marker_config_survives_pickle() -> None:
 
     assert type(restored) is MetalGGUFConfig
     assert restored.get_name() == "gguf"
-
-
-def test_loader_import_without_gguf_names_the_extra(monkeypatch) -> None:
-    """The optional-dep owner gives an actionable hint when the extra is
-    missing (0.24 dropped ``gguf`` from vLLM's own dependencies).
-    """
-    monkeypatch.setitem(sys.modules, "gguf", None)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.loader", raising=False)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.mlx_native", raising=False)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.adapter", raising=False)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.wrappers", raising=False)
-
-    with pytest.raises(ImportError) as exc_info:
-        import vllm_metal.gguf.loader  # noqa: F401
-    assert str(exc_info.value) == (
-        "GGUF support requires the optional 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    )
 
 
 def test_probe_preserves_positional_speculative_config(gguf_file) -> None:
@@ -426,6 +475,12 @@ def test_entry_point_mounts_without_manual_register(
     repo_root = Path(vllm_integration.__file__).resolve().parents[2]
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{tmp_path}"
+    # The local case starts from an empty cache root so vLLM's real
+    # per-architecture registry subprocess runs (the in-process fixture skips
+    # it for the other tests); one cold architecture is enough to cover it.
+    cache_root = tmp_path / "vllm-cache"
+    if not offline_remote:
+        env["VLLM_CACHE_ROOT"] = str(cache_root)
     if offline_remote:
         gguf_file = "Qwen/Qwen3-0.6B-GGUF:Q8_0"
         env["HF_HUB_OFFLINE"] = "1"
@@ -447,6 +502,10 @@ def test_entry_point_mounts_without_manual_register(
 
     assert result.returncode == 0, result.stderr[-2000:]
     assert f"EP-OK gguf {gguf_file}" in result.stdout
+    if not offline_remote:
+        assert any((cache_root / "modelinfos").glob("*.json")), (
+            "registry subprocess did not populate the cold cache"
+        )
 
 
 def test_remote_reference_grammar() -> None:
@@ -473,13 +532,12 @@ def test_remote_reference_grammar() -> None:
 
 
 @pytest.mark.parametrize("quant", ["Q8_0", "Q5_0", "Q5_1", "Q2_K", "Q3_K_M"])
-def test_remote_load_source_downloads_one_matching_gguf(
+def test_remote_load_source_downloads_weights_and_config_without_tokenizer(
     tmp_path, monkeypatch, quant: str
 ) -> None:
     weight_snapshot = tmp_path / "weights"
     config_snapshot = tmp_path / "config"
-    tokenizer_snapshot = tmp_path / "tokenizer"
-    for directory in (weight_snapshot, config_snapshot, tokenizer_snapshot):
+    for directory in (weight_snapshot, config_snapshot):
         directory.mkdir()
     (config_snapshot / "config.json").write_text(json.dumps(_TINY_CONFIG))
     gguf_path = weight_snapshot / f"Qwen3-0.6B-{quant}.gguf"
@@ -502,8 +560,6 @@ def test_remote_load_source_downloads_one_matching_gguf(
             return str(weight_snapshot)
         if kwargs["repo_id"] == "Qwen/Qwen3-0.6B":
             return str(config_snapshot)
-        if kwargs["repo_id"] == "Qwen/Qwen3-0.6B-Tokenizer":
-            return str(tokenizer_snapshot)
         raise AssertionError(f"unexpected repo_id={kwargs['repo_id']!r}")
 
     monkeypatch.setattr(
@@ -531,8 +587,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
     assert source is not None
     assert source.weights_path == str(gguf_path)
     assert source.config_dir == str(config_snapshot)
-    assert source.tokenizer_dir == str(tokenizer_snapshot)
-    # The weights repo gets its own revision; the companion repos keep theirs.
+    # The weights repo gets its own revision; the config keeps its requested one.
     assert resolve_calls == [
         (
             "Qwen/Qwen3-0.6B-GGUF",
@@ -551,7 +606,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
             "token": "hf-token",
         }
     ]
-    config_call, weight_call, tokenizer_call = calls
+    config_call, weight_call = calls
     assert weight_call == {
         "repo_id": "Qwen/Qwen3-0.6B-GGUF",
         "cache_dir": str(tmp_path / "cache"),
@@ -565,22 +620,6 @@ def test_remote_load_source_downloads_one_matching_gguf(
         "cache_dir": str(tmp_path / "cache"),
         "allow_patterns": ["config.json", "generation_config.json"],
         "revision": "rev-a",
-        "token": "hf-token",
-    }
-    assert tokenizer_call == {
-        "repo_id": "Qwen/Qwen3-0.6B-Tokenizer",
-        "cache_dir": str(tmp_path / "cache"),
-        "allow_patterns": [
-            "*.json",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ],
-        "revision": "tok-rev",
         "token": "hf-token",
     }
 
@@ -655,13 +694,18 @@ def test_remote_load_source_repins_the_config_repo_revision_offline(
         # Dropping a shard set still leaves its single file as a candidate.
         (
             [
-                "mmproj-model-Q8_0.gguf",
                 "model-Q8_0-00001-of-00002.gguf",
                 "model-Q8_0-00002-of-00002.gguf",
                 "model-Q8_0.gguf",
+                "other-Q8_0.gguf",
             ],
             "Remote GGUF reference 'Qwen/Qwen3-0.6B-GGUF:Q8_0' matched "
-            "multiple files: mmproj-model-Q8_0.gguf, model-Q8_0.gguf.",
+            "multiple files: model-Q8_0.gguf, other-Q8_0.gguf.",
+        ),
+        # A projector is never the backbone, even when it is the only match.
+        (
+            ["mmproj-model-Q8_0.gguf"],
+            "No 'Q8_0' GGUF file found in remote repository 'Qwen/Qwen3-0.6B-GGUF'.",
         ),
     ],
 )
@@ -728,7 +772,12 @@ def test_remote_load_source_rejects_unsupported_tag_before_download(
 
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
-    [("qwen3_moe", "Qwen3MoeForCausalLM"), ("phi3", "Phi3ForCausalLM")],
+    [
+        ("qwen3_moe", "Qwen3MoeForCausalLM"),
+        ("phi3", "Phi3ForCausalLM"),
+        ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        ("qwen3_5_text", "Qwen3_5ForCausalLM"),
+    ],
 )
 def test_remote_load_source_rejects_unsupported_family_before_download(
     tmp_path, monkeypatch, model_type: str, architecture: str
@@ -743,14 +792,14 @@ def test_remote_load_source_rejects_unsupported_family_before_download(
     model_config = _engine_args(
         model="org/model-GGUF:Q4_K_M", tokenizer=str(tmp_path)
     ).create_model_config()
-    supported = sorted(GGUFModelAdapter.SUPPORTED_DENSE_ARCHS)
+    supported = sorted(GGUFModelAdapter.SUPPORTED_ARCHS)
 
     with pytest.raises(GGUFLoadError) as excinfo:
         gguf_source.GGUFLoadSource.from_model_config(model_config)
 
     assert str(excinfo.value) == (
-        f"Config model_type {model_type!r} is not a supported dense decoder; "
-        f"the GGUF loader supports {supported}."
+        f"Config model_type {model_type!r} is not supported; the GGUF loader "
+        f"supports {supported}."
     )
 
 
@@ -807,18 +856,22 @@ def test_remote_load_source_admits_mistral_repo_config(tmp_path, monkeypatch) ->
 
 @pytest.mark.parametrize("offline", [False, True])
 @pytest.mark.parametrize("tag", ["F16", "F32", "BF16"])
-def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> None:
+def test_remote_plain_type_tags_resolve_past_projector_siblings(
+    tmp_path, monkeypatch, tag, offline
+) -> None:
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", offline)
     snapshot = tmp_path / "weights"
     snapshot.mkdir()
     gguf_name = f"model-{tag}.gguf"
-    (snapshot / gguf_name).write_text("dummy")
+    repo_files = [gguf_name, f"mmproj-{tag}.gguf", f"mmproj-model-{tag.lower()}.gguf"]
+    for filename in repo_files:
+        (snapshot / filename).write_text("dummy")
     monkeypatch.setattr(
         gguf_source,
         "HfApi",
         lambda: SimpleNamespace(
             resolve_revision=_echo_revision,
-            list_repo_files=lambda **_: ["README.md", gguf_name],
+            list_repo_files=lambda **_: ["README.md", *repo_files],
         ),
     )
     monkeypatch.setattr(gguf_source, "snapshot_download", lambda **_: str(snapshot))
@@ -833,7 +886,9 @@ def test_remote_plain_type_tags_resolve(tmp_path, monkeypatch, tag, offline) -> 
     assert resolved == str(snapshot / gguf_name)
 
 
-@pytest.mark.parametrize("tag", ["Q6_K", "Q6_K_L", "Q8_0"])
+@pytest.mark.parametrize(
+    "tag", ["Q6_K", "Q6_K_L", "Q8_0", "IQ4_NL", "IQ4_XS", "IQ3_S", "IQ3_M"]
+)
 def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
     snapshot = tmp_path / "weights"
     repo_files = [
@@ -843,6 +898,10 @@ def test_remote_tag_resolves_its_own_file(tmp_path, monkeypatch, tag) -> None:
         "model-Q8_0-00001-of-00002.gguf",
         "model-Q8_0-00002-of-00002.gguf",
         "model-Q8_0.gguf",
+        "model-IQ4_NL.gguf",
+        "model-IQ4_XS.gguf",
+        "model-IQ3_S.gguf",
+        "model-IQ3_M.gguf",
     ]
     monkeypatch.setattr(
         gguf_source,
@@ -923,10 +982,10 @@ def test_remote_offline_rejects_ambiguous_cached_listing(tmp_path, monkeypatch) 
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True)
     snapshot = tmp_path / "weights"
     snapshot.mkdir()
-    (snapshot / "mmproj-model-Q8_0.gguf").write_text("dummy")
+    (snapshot / "other-Q8_0.gguf").write_text("dummy")
     listing = [
         RepoFile(path=path, size=0, oid="0")
-        for path in ("mmproj-model-Q8_0.gguf", "model-Q8_0.gguf")
+        for path in ("model-Q8_0.gguf", "other-Q8_0.gguf")
     ]
 
     def partial_snapshot_download(**_: object) -> str:
@@ -948,5 +1007,5 @@ def test_remote_offline_rejects_ambiguous_cached_listing(tmp_path, monkeypatch) 
 
     assert str(excinfo.value) == (
         "Remote GGUF reference 'org/model:Q8_0' matched multiple files: "
-        "mmproj-model-Q8_0.gguf, model-Q8_0.gguf."
+        "model-Q8_0.gguf, other-Q8_0.gguf."
     )

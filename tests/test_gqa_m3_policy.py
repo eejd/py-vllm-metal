@@ -34,7 +34,8 @@ def _native_diagnostics():
         ((24, 4, 256, 16), [4096] * 4, 256),
         ((24, 4, 256, 16), [8192] * 8, 256),
         ((24, 4, 256, 16), [1] * 63 + [131072], 256),
-        ((24, 4, 256, 16), [1] * 127 + [131072], 0),
+        ((24, 4, 256, 16), [1] * 127 + [131072], 256),
+        ((24, 4, 256, 16), [131072] * 128, 0),  # Still exceeds compact budget.
         ((24, 4, 256, 16), [1, 255, 256, 8192], 256),
         ((16, 2, 256, 16), [4095] * 5, 512),
         ((16, 2, 256, 16), [4096] * 5, 256),
@@ -63,7 +64,8 @@ def _native_diagnostics():
         ((16, 2, 128, 16), [8192] * 5, 512),
         # Functional admission and malformed-length handling are unchanged.
         ((16, 4, 256, 16), [8192] * 4, 0),
-        ((24, 4, 256, 32), [8192] * 4, 0),
+        # (24, 4, 256) uses the existing head256/block32 M3 preference.
+        ((24, 4, 256, 32), [8192] * 4, 256),
         ((24, 4, 256, 16), [], 0),
         ((24, 4, 256, 16), [0, 8192], 0),
         ((24, 4, 256, 16), [-1, 8192], 0),
@@ -336,8 +338,7 @@ def test_native_selection_keeps_resource_feasible_partition(
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3, rtol=0)
     # Exercise the selected M3 specialization on non-M3 CI as well. Only
     # occupancy/preference is forced; real pipeline resource checks remain.
-    selected = mx.array(0)
-    ops._gqa_paged_attention_for_test(
+    selected = ops._gqa_paged_attention_for_test(
         query,
         keys,
         values,
@@ -347,7 +348,6 @@ def test_native_selection_keeps_resource_feasible_partition(
         block,
         maximum,
         m3_partition,
-        selected,
     )
     mx.eval(selected)
     assert ops.last_gqa_partition_size() == m3_partition

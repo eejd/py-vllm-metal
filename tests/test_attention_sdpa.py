@@ -24,7 +24,7 @@ import pytest
 import torch
 from mlx.utils import tree_flatten
 from vllm.config import VllmConfig
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -143,16 +143,18 @@ def _make_inner(
     *,
     with_v_proj: bool = True,
     with_v_norm: bool = False,
+    head_dim: int = _HEAD_DIM,
+    dtype: mx.Dtype = mx.float32,
 ) -> SimpleNamespace:
     """Build a fake Attention module matching sdpa_forward's contract."""
-    q_weight = mx.ones((_N_HEADS * _HEAD_DIM, _HIDDEN))
-    k_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))
-    v_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))
+    q_weight = mx.ones((_N_HEADS * head_dim, _HIDDEN), dtype=dtype)
+    k_weight = mx.ones((_N_KV_HEADS * head_dim, _HIDDEN), dtype=dtype)
+    v_weight = mx.ones((_N_KV_HEADS * head_dim, _HIDDEN), dtype=dtype)
 
     inner = SimpleNamespace(
         n_heads=_N_HEADS,
         n_kv_heads=_N_KV_HEADS,
-        scale=_HEAD_DIM**-0.5,
+        scale=head_dim**-0.5,
         q_proj=_FakeLinear(q_weight),
         k_proj=_FakeLinear(k_weight),
         rope=_identity_rope,
@@ -681,7 +683,6 @@ class _PagedRoutingOpsSpy:
             "gqa_decode": True,
             "gqa_disable": True,
             "decode_routing_metadata": True,
-            "gqa_batch_context_lens": True,
             "gqa_length_plan": True,
         }
 
@@ -720,7 +721,6 @@ class _PagedRoutingOpsSpy:
         block_size: int,
         _max_seq_len: int,
         _sliding_window: int,
-        _out: mx.array,
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
         mm_prefix_ranges: mx.array | None = None,
@@ -728,9 +728,10 @@ class _PagedRoutingOpsSpy:
         num_decode_tokens: int = 0,
         max_decode_context_len: int = 0,
         gqa_disabled: bool = False,
-        gqa_context_lens: list[int] | None = None,
         gqa_length_plan: object = None,
-    ) -> None:
+        nax_split_hint: int = -1,
+        nax_prefill_split_hint: int = -1,
+    ) -> mx.array:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
@@ -739,8 +740,32 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
         self.calls[-1].num_decode_tokens = num_decode_tokens
         self.calls[-1].max_decode_context_len = max_decode_context_len
-        self.calls[-1].gqa_context_lens = gqa_context_lens
         self.calls[-1].gqa_length_plan = gqa_length_plan
+        self.calls[-1].nax_split_hint = nax_split_hint
+        self.calls[-1].nax_prefill_split_hint = nax_prefill_split_hint
+        return mx.zeros_like(_query)
+
+
+class _TurboQuantRoutingOpsSpy(_PagedRoutingOpsSpy):
+    """Routing spy for TurboQuant caches: tq_encode stands in for the write."""
+
+    def tq_encode(self, _k, _v, k_cache, v_cache, k_scale, v_scale, k_zero, *_args):
+        self.calls.append(SimpleNamespace(cache_block_size=k_cache.shape[1]))
+        return k_cache, v_cache, k_scale, v_scale, k_zero
+
+    def paged_attention_primitive(self, *args, use_turboquant=False, **kwargs):
+        for name in (
+            "key_scale_cache",
+            "value_scale_cache",
+            "key_zero_cache",
+            "v_centroids",
+            "quant_type",
+            "v_bits",
+        ):
+            kwargs.pop(name, None)
+        out = super().paged_attention_primitive(*args, **kwargs)
+        self.calls[-1].use_turboquant = use_turboquant
+        return out
 
 
 class _PreMmPrefixOps(_PagedOpsCapsOff):
@@ -760,7 +785,7 @@ class _PreMmPrefixOps(_PagedOpsCapsOff):
         sinks=None,
         num_decode_requests=-1,
     ):
-        self._spy.paged_attention_primitive(
+        return self._spy.paged_attention_primitive(
             *args,
             window_seqlen_q=window_seqlen_q,
             sinks=sinks,
@@ -770,6 +795,36 @@ class _PreMmPrefixOps(_PagedOpsCapsOff):
 
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
+
+    @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
+    def test_output_projection_receives_the_query_dtype(
+        self, cache_dtype: mx.Dtype
+    ) -> None:
+        """A float16 checkpoint with a bfloat16 cache must hand o_proj the
+        float16 query dtype: MLX promotes a bfloat16/float16 mix to a float32
+        residual stream."""
+        inner = _make_inner(dtype=mx.float16)
+        projected: list[mx.Dtype] = []
+
+        def o_proj(out: mx.array) -> mx.array:
+            projected.append(out.dtype)
+            return out
+
+        inner.o_proj = o_proj
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=cache_dtype,
+        )
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        with patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()):
+            output, _ = sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
+
+        assert projected == [mx.float16]
+        assert output.dtype == mx.float16
 
     def test_deepseek_num_kv_heads_naming_reaches_kernel(self) -> None:
         """DeepSeek exposes ``num_kv_heads``, not ``num_key_value_heads``."""
@@ -816,9 +871,10 @@ class TestSDPAForward:
                 scale,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["num_kv_heads"] = num_kv_heads
                 captured["scale"] = scale
+                return mx.zeros_like(_query)
 
         with (
             patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
@@ -893,7 +949,7 @@ class TestSDPAForward:
         assert spy.calls[-1].num_decode_requests == 1
 
     @pytest.mark.parametrize("disabled", [False, True])
-    @pytest.mark.parametrize("capability", ["none", "plan"])
+    @pytest.mark.parametrize("capability", ["none", "plan", "mixed_plan"])
     @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
     def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
         self, monkeypatch, disabled, capability, kind
@@ -919,7 +975,8 @@ class TestSDPAForward:
                 "gqa_decode": True,
                 "gqa_disable": True,
                 "decode_routing_metadata": True,
-                "gqa_length_plan": capability == "plan",
+                "gqa_length_plan": capability in ("plan", "mixed_plan"),
+                "gqa_mixed_decode_plan": capability == "mixed_plan",
             }
         )
         monkeypatch.setattr(spy, "paged_attention_capabilities", query)
@@ -936,7 +993,12 @@ class TestSDPAForward:
         total = len(ctx.slot_mapping)
         x = mx.ones((1, total, _HIDDEN), mx.float16)
         zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
-        eligible = kind == "decode" and not disabled
+        # Ordinary decode rows: the whole decode batch, or (with the mixed
+        # capability) the leading decode rows of a mixed batch.
+        planned = capability in ("plan", "mixed_plan")
+        eligible = not disabled and (
+            kind == "decode" or (kind == "mixed" and capability == "mixed_plan")
+        )
         with (
             patch.object(sdpa_mod, "get_ops", return_value=spy),
             patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
@@ -944,16 +1006,137 @@ class TestSDPAForward:
             for _layer in range(3):
                 sdpa_forward(inner, x, ctx, cache, layer_idx=0)
             plan = spy.calls[-1].gqa_length_plan
-            assert plan == ((2, 4) if eligible and capability == "plan" else None)
-            assert len(spy.length_plans) == int(eligible and capability == "plan")
+            assert plan == ((2, 4) if eligible and planned else None)
+            assert len(spy.length_plans) == int(eligible and planned)
             query.assert_called_once_with()
-            if eligible and capability == "plan":
+            if eligible and planned and kind == "decode":
                 # A new forward has new lengths and must not reuse the old plan.
                 prepare_grouped([([[1]], 4), ([[0]], 2)], [], (8,))
                 next_ctx = get_context()
                 sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
                 assert spy.length_plans == [(2, 4), (5, 3)]
                 assert spy.calls[-1].gqa_length_plan is not plan
+            if eligible and planned and kind == "mixed":
+                # Later forwards change decode membership, order and lengths;
+                # each plans only its own leading decode rows, once per forward.
+                forwards = [
+                    ([([[2]], 6), ([[0]], 2), ([[1]], 4)], [([[1]], 2, 0)], (7, 3, 5)),
+                    ([([[1]], 3)], [([[0]], 1, 0), ([[2]], 2, 1)], (4,)),
+                ]
+                expected = [(2, 4)]
+                for next_decode, next_prefill, next_plan in forwards:
+                    prepare_grouped(next_decode, next_prefill, (8,))
+                    next_ctx = get_context()
+                    tokens = len(next_ctx.slot_mapping)
+                    next_x = mx.ones((1, tokens, _HIDDEN), mx.float16)
+                    for _layer in range(2):
+                        sdpa_forward(inner, next_x, next_ctx, cache, layer_idx=0)
+                    expected.append(next_plan)
+                    assert spy.length_plans == expected
+                    assert spy.calls[-1].gqa_length_plan == next_plan
+                    assert spy.calls[-1].num_decode_requests == len(next_plan)
+
+    @pytest.mark.parametrize(
+        ("disabled", "expected_plan"), [(False, (2, 4)), (True, None)]
+    )
+    def test_turboquant_decode_batch_forwards_gqa_metadata(
+        self, monkeypatch, disabled, expected_plan
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        head_dim = 64
+        prepare_grouped([([[0]], 1), ([[1]], 3)], [], (8,))
+        ctx = get_context()
+        spy = _TurboQuantRoutingOpsSpy()
+        inner = _make_inner(head_dim=head_dim)
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=head_dim,
+            num_blocks=3,
+            block_size=8,
+            dtype=mx.float16,
+            turboquant=True,
+            k_quant="q8_0",
+            v_quant="q3_0",
+        )
+        x = mx.ones((1, 2, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, 2, _N_HEADS * head_dim), mx.float16)
+
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+
+        call = spy.calls[-1]
+        assert call.use_turboquant
+        assert call.gqa_disabled is disabled
+        assert (call.num_decode_requests, call.num_decode_tokens) == (2, 2)
+        assert call.max_decode_context_len == 4
+        assert call.gqa_length_plan == expected_plan
+
+    @pytest.mark.parametrize(
+        "supported,kind",
+        [
+            ("subset", "decode"),
+            ("subset", "prefill"),
+            ("subset", "mixed"),
+            ("subset", "expanded_verify"),
+            ("whole", "mixed"),
+            ("none", "mixed"),
+        ],
+    )
+    def test_nax_hints_follow_batch_shape_and_native_capabilities(
+        self, monkeypatch, supported, kind
+    ) -> None:
+        decode = [([[0] * 65], 511), ([[1] * 65], 511)] if kind != "prefill" else []
+        if kind == "expanded_verify":
+            decode = [([[0] * 65], 511, 2), ([[1] * 65], 511, 2)]
+        prefill = [([[2] * 32], 256, 0)] if kind != "decode" else []
+        prepare_grouped(decode, prefill, (8,))
+        ctx = get_context()
+        # Disabling GQA does not disable native mixed-batch separation.
+        ctx.gqa_disabled = True
+        spy = _PagedRoutingOpsSpy()
+        caps = {
+            **spy.paged_attention_capabilities(),
+            "nax_split_hint": supported != "none",
+            "nax_prefill_split_hint": supported == "subset",
+        }
+        monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
+        work = MagicMock(wraps=sdpa_mod.nax_tile_work)
+        monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=3,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        total = len(ctx.slot_mapping)
+        x = mx.ones((1, total, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
+        subset = supported == "subset" and kind == "mixed"
+        windows = (-1, 128, -1, 128) if subset else (-1,)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            for window in windows:
+                cache.sliding_window_per_layer[0] = window
+                sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        forwarded = supported != "none" and kind != "decode"
+        # The full prefill blocks split on their own; decode partial tiles
+        # keep the whole mixed batch unsplit, including at window 128.
+        whole_hint = int(kind == "prefill")
+        assert spy.calls[-1].nax_split_hint == (whole_hint if forwarded else -1)
+        assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
+        # Matching layers reuse each whole/subset plan for their window.
+        assert work.call_count == len(set(windows)) * (int(forwarded) + int(subset))
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
@@ -1102,9 +1285,10 @@ class TestSDPAForward:
                 scale,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["num_kv_heads"] = num_kv_heads
                 captured["scale"] = scale
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1186,9 +1370,10 @@ class TestSDPAForward:
                 *_args,
                 sinks=None,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["scale"] = scale
                 captured["sinks"] = sinks
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1288,8 +1473,9 @@ class TestSDPAForward:
                 softcap,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["softcap"] = softcap
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1368,9 +1554,10 @@ class TestSDPAForward:
                 value_cache,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["key_cache"] = key_cache
                 captured["value_cache"] = value_cache
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1428,9 +1615,10 @@ class TestSDPAForward:
                 value_cache,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["key_cache"] = key_cache
                 captured["value_cache"] = value_cache
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1733,6 +1921,66 @@ class TestApplyGProjGate:
         assert mx.allclose(result, expected, atol=1e-6).item()
 
 
+class TestLfm3Attention:
+    @pytest.mark.parametrize("layer_type", ["full_attention", "sliding_attention"])
+    @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+    def test_prefill_and_decode_match_native_head_gating(self, layer_type, dtype):
+        from mlx_vlm.models.base import create_attention_mask
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.models.lfm3.config import ModelConfig
+        from mlx_vlm.models.lfm3.language import Attention
+
+        mx.random.seed(0)
+        window = 4 if layer_type == "sliding_attention" else -1
+        config = ModelConfig(
+            hidden_size=128,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=64,
+            num_hidden_layers=1,
+            layer_types=[layer_type],
+            sliding_window=4,
+        )
+        attention = Attention(config, layer_type)
+        attention.set_dtype(dtype)
+        reference_cache = RotatingKVCache(max_size=4) if window > 0 else KVCache()
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            num_blocks=1,
+            block_size=16,
+            dtype=dtype,
+            sliding_window_per_layer=[window],
+        )
+        offset = 0
+        for length in (6, 1):
+            x = mx.random.normal((1, length, 128)).astype(dtype)
+            mask = create_attention_mask(
+                x, reference_cache, window_size=window if window > 0 else None
+            )
+            expected = attention(x, mask=mask, cache=reference_cache)
+            context = PagedAttentionContext(
+                slot_mapping=list(range(offset, offset + length)),
+                block_tables=[[0]],
+                context_lens=[offset + length],
+                offsets=[offset],
+                cu_seqlens=[0, length],
+            )
+            actual, _ = sdpa_forward(
+                attention,
+                x,
+                context,
+                cache,
+                layer_idx=0,
+                attention_contract=attention_contract_for(attention),
+            )
+            mx.eval(actual, expected)
+            tolerance = 1e-2 if dtype == mx.bfloat16 else 2e-5
+            assert mx.allclose(actual, expected, atol=tolerance, rtol=tolerance).item()
+            offset += length
+
+
 class TestPhiAttention:
     """Phi-1/1.5 (``mlx_lm.models.phi``) reaches the paged kernel.
 
@@ -1791,6 +2039,7 @@ class TestPhiAttention:
                 self, _query, _key_cache, _value_cache, _num_kv_heads, scale, *_a, **_k
             ):
                 captured["scale"] = scale
+                return mx.zeros_like(_query)
 
         with (
             patch.object(

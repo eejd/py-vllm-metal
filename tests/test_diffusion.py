@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.outputs import LogprobsLists
 
 import vllm_metal.compat as compat
@@ -23,6 +24,7 @@ from vllm_metal.v1.diffusion import (
     denoise_update,
     entropy_bound_mask,
     join_canvas_logprobs,
+    mask_to_allowed,
     schedule_temperature,
 )
 
@@ -173,10 +175,20 @@ class TestSamplerMath:
         history: list[mx.array] = []
 
         first = denoise_update(
-            peaked, step=0, history=history, settings=settings, vocab_size=_VOCAB
+            peaked,
+            step=0,
+            history=history,
+            settings=settings,
+            vocab_size=_VOCAB,
+            max_steps=settings.max_denoising_steps,
         )
         second = denoise_update(
-            peaked, step=1, history=history, settings=settings, vocab_size=_VOCAB
+            peaked,
+            step=1,
+            history=history,
+            settings=settings,
+            vocab_size=_VOCAB,
+            max_steps=settings.max_denoising_steps,
         )
 
         # No previous canvas to compare against on the first step.
@@ -192,14 +204,70 @@ class TestSamplerMath:
         flat = mx.zeros((_CANVAS, _VOCAB))
 
         early = denoise_update(
-            flat, step=1, history=[], settings=settings, vocab_size=_VOCAB
+            flat,
+            step=1,
+            history=[],
+            settings=settings,
+            vocab_size=_VOCAB,
+            max_steps=settings.max_denoising_steps,
         )
         last = denoise_update(
-            flat, step=2, history=[], settings=settings, vocab_size=_VOCAB
+            flat,
+            step=2,
+            history=[],
+            settings=settings,
+            vocab_size=_VOCAB,
+            max_steps=settings.max_denoising_steps,
         )
 
         assert not early.converged
         assert last.converged
+
+
+class TestStructuredReadMath:
+    def test_step_cap_converges_early_on_the_global_temperature_schedule(
+        self,
+    ) -> None:
+        settings = _settings(max_denoising_steps=4, t_max=0.8)
+        flat = mx.zeros((_CANVAS, _VOCAB))
+        logits = mx.ones((_CANVAS, _VOCAB))
+
+        outcome = denoise_update(
+            logits,
+            step=0,
+            history=[],
+            settings=settings,
+            vocab_size=_VOCAB,
+            max_steps=1,
+        )
+
+        assert outcome.converged
+        # A one-step read runs at t_max, not at the end of a one-step schedule.
+        np.testing.assert_allclose(np.array(outcome.processed_logits), 1 / 0.8)
+        assert not denoise_update(
+            flat, step=0, history=[], settings=settings, vocab_size=_VOCAB, max_steps=2
+        ).converged
+
+    def test_mask_renormalizes_over_the_allowed_ids(self) -> None:
+        logits = mx.array([[5.0, 1.0, 2.0, 0.0]])
+        allowed = mx.array([False, True, True, False])
+
+        masked = mask_to_allowed(logits, allowed)
+        outcome = denoise_update(
+            masked,
+            step=0,
+            history=[],
+            settings=_settings(),
+            vocab_size=4,
+            max_steps=1,
+        )
+
+        probs = np.array(mx.softmax(masked, axis=-1))
+        np.testing.assert_allclose(probs[0], [0, 1 / (1 + np.e), np.e / (1 + np.e), 0])
+        assert outcome.argmax_canvas.tolist() == [2]
+        # The finite sentinel keeps the entropy finite, so the step stays defined.
+        assert outcome.next_canvas.tolist()[0] in range(4)
+        assert not np.isnan(np.array(outcome.processed_logits)).any()
 
 
 class TestCanvasLogprobs:
@@ -337,18 +405,25 @@ def _scheduler_output(
 
 
 def _new_req(
-    req_id: str, params: SamplingParams | None = None, prompt=(7, 8)
-) -> SimpleNamespace:
-    return SimpleNamespace(
+    req_id: str,
+    params: SamplingParams | None = None,
+    prompt=(7, 8),
+    prefill_token_ids: list[int] | None = None,
+) -> NewRequestData:
+    return NewRequestData(
         req_id=req_id,
         prompt_token_ids=list(prompt),
+        mm_features=[],
         sampling_params=params,
+        pooling_params=None,
         block_ids=([0],),
         num_computed_tokens=0,
+        lora_request=None,
+        prefill_token_ids=prefill_token_ids,
     )
 
 
-def _step(rt: DiffusionGemmaRuntime, *req_ids: str, new_reqs=()):
+def _step(rt: DiffusionGemmaRuntime, *req_ids: str, new_reqs=(), finished=()):
     """One engine step: new requests prefill whole, running ones run their drafts."""
     runner = rt._runner
     drafts = runner._draft_token_ids
@@ -365,7 +440,16 @@ def _step(rt: DiffusionGemmaRuntime, *req_ids: str, new_reqs=()):
             cached={r: len(runner._request_states[r].token_ids) for r in req_ids},
             scheduled=scheduled,
             drafts={r: pending[r] for r in req_ids},
+            finished=set(finished),
         )
+    )
+
+
+def _read(**extra_args) -> SamplingParams:
+    """A structured read, as structured_server.py sends it."""
+    return SamplingParams(
+        logprob_token_ids=[3, 4],
+        extra_args={"diffusion_read_only": True, **extra_args},
     )
 
 
@@ -404,13 +488,7 @@ class TestRuntimeStepProtocol:
         rt, forwards = runtime
         runner = rt._runner
         prompt = [7, 8, 9]
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=prompt,
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=prompt)
 
         # Prefill: encoder pass, nothing sampled, a random canvas as drafts.
         out = rt.execute_model(
@@ -448,13 +526,7 @@ class TestRuntimeStepProtocol:
 
     def test_intermediate_prefill_chunk_hands_back_no_drafts(self, runtime) -> None:
         rt, _ = runtime
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2, 3, 4],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2, 3, 4])
 
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
 
@@ -462,13 +534,7 @@ class TestRuntimeStepProtocol:
 
     def test_rejects_drafts_that_differ_from_the_canvas(self, runtime) -> None:
         rt, _ = runtime
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
 
         with pytest.raises(RuntimeError, match="out of sync"):
@@ -481,13 +547,7 @@ class TestRuntimeStepProtocol:
     def test_clipped_denoise_step_keeps_the_full_canvas(self, runtime) -> None:
         rt, forwards = runtime
         runner = rt._runner
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
         canvas = runner._draft_token_ids.draft_token_ids[0]
 
@@ -508,13 +568,7 @@ class TestRuntimeStepProtocol:
         rt, _ = runtime
         runner = rt._runner
         rt.settings = _settings(max_denoising_steps=1)
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
         canvas = runner._draft_token_ids.draft_token_ids[0]
 
@@ -575,21 +629,162 @@ class TestRuntimeStepProtocol:
         b = out.logprobs.slice_request(1, _CANVAS)
         assert b.logprob_token_ids.tolist() == [[t, 4, 5] for t in [3, 1, 4, 1]]
 
+    def test_seed_replaces_only_the_first_canvas_after_the_prompt(
+        self, runtime, monkeypatch
+    ) -> None:
+        rt, _ = runtime
+        runner = rt._runner
+        monkeypatch.setattr(
+            diffusion,
+            "random_canvas",
+            lambda length, vocab_size: mx.full((length,), 15, dtype=mx.int32),
+        )
+        seeded = SamplingParams(extra_args={"diffusion_seed_canvas": [5, 6, 7, 8]})
+
+        _step(rt, new_reqs=[_new_req("s", seeded), _new_req("u")])
+
+        assert runner._draft_token_ids.draft_token_ids == [[5, 6, 7, 8], [15] * 4]
+        for _ in range(3):  # two denoise steps, then the commit
+            out = _step(rt, "s", "u")
+        assert out.sampled_token_ids == [[3, 1, 4, 1], [3, 1, 4, 1]]
+        assert runner._draft_token_ids.draft_token_ids == [[15] * 4, [15] * 4]
+
+    def test_pinned_rows_hold_the_seed_and_drop_self_conditioning(
+        self, runtime, monkeypatch
+    ) -> None:
+        rt, _ = runtime
+        monkeypatch.setattr(
+            diffusion,
+            "self_conditioning_embeddings",
+            lambda model, logits: mx.ones((logits.shape[0], _HIDDEN)),
+        )
+        params = SamplingParams(
+            extra_args={
+                "diffusion_seed_canvas": [5, 6, 7, 8],
+                "diffusion_pinned": [0, 2],
+            }
+        )
+        _step(rt, new_reqs=[_new_req("r", params)])
+
+        _step(rt, "r")
+
+        # The model predicts [3, 1, 4, 1]; the pinned rows keep the seed.
+        assert rt._runner._draft_token_ids.draft_token_ids == [[5, 1, 7, 1]]
+        soft = rt._soft_embeddings(rt._requests["r"], _CANVAS)
+        assert soft.sum(axis=-1).tolist() == [0, _HIDDEN, 0, _HIDDEN]
+
+    @pytest.mark.parametrize(
+        "extra_args",
+        [None, {"diffusion_max_steps": None}],
+        ids=["omitted", "explicit-none"],
+    )
+    def test_step_cap_is_per_request(self, runtime, extra_args) -> None:
+        rt, _ = runtime
+        capped = SamplingParams(extra_args={"diffusion_max_steps": 1})
+        free = SamplingParams(extra_args=extra_args)
+        _step(rt, new_reqs=[_new_req("capped", capped), _new_req("free", free)])
+
+        _step(rt, "capped", "free")  # only the capped canvas converges
+        out = _step(rt, "capped", "free")
+
+        assert out.sampled_token_ids == [[3, 1, 4, 1], []]
+        # A cap past the model's budget is the budget.
+        huge = SamplingParams(extra_args={"diffusion_max_steps": 1000})
+        assert rt._new_request(huge).max_steps == rt.settings.max_denoising_steps
+
+    def test_read_emits_on_convergence_while_generation_commits(self, runtime) -> None:
+        rt, forwards = runtime
+        gen = _new_req("gen", SamplingParams(logprobs=1))
+        read = _new_req(
+            "read",
+            _read(diffusion_seed_canvas=[9] * _CANVAS, diffusion_max_steps=2),
+            prompt=(1, 2, 3),
+        )
+        _step(rt, new_reqs=[gen])
+        _step(rt, "gen", new_reqs=[read])
+        _step(rt, "gen", "read")  # gen converges, the read takes its first step
+
+        out = _step(rt, "gen", "read")  # gen commits, the read converges
+
+        assert out.sampled_token_ids == [[3, 1, 4, 1], [3, 1, 4, 1]]
+        # The commit ran the encoder over gen's canvas; the read only denoised.
+        assert forwards[-2] == (False, [(2, [3, 1, 4, 1])])
+        assert forwards[-1] == (True, [(3, [3, 1, 4, 1])])
+        assert out.logprobs.cu_num_generated_tokens == [0, _CANVAS]
+        gen_rows = out.logprobs.slice_request(0, _CANVAS)
+        read_rows = out.logprobs.slice_request(1, _CANVAS)
+        assert gen_rows.logprob_token_ids[:, :2].tolist() == [
+            [t, t] for t in [3, 1, 4, 1]
+        ]
+        assert read_rows.logprob_token_ids.tolist() == [[t, 3, 4] for t in [3, 1, 4, 1]]
+        # Temperature 1: logits of +-50 put an off-target id at -100, where
+        # the step's 0.8 schedule would put it at -125.
+        np.testing.assert_allclose(read_rows.logprobs[0, 2], -100.0, rtol=1e-4)
+        state = rt._runner._request_states["read"]
+        assert state.token_ids == [1, 2, 3, 3, 1, 4, 1]
+
+        # Reaching max_tokens ends the read; it never runs a commit forward.
+        _step(rt, "gen", finished={"read"})
+        assert "read" not in rt._requests
+        assert all(start != 3 for _, segs in forwards[-1:] for start, _ in segs)
+
+    def test_clipped_read_emits_its_rows_and_converges_again(self, runtime) -> None:
+        rt, _ = runtime
+        runner = rt._runner
+        _step(rt, new_reqs=[_new_req("r", _read(diffusion_max_steps=1))])
+        canvas = runner._draft_token_ids.draft_token_ids[0]
+
+        # The token budget clipped the read's only step to two rows.
+        out = rt.execute_model(
+            _scheduler_output(
+                cached={"r": 2}, scheduled={"r": 2}, drafts={"r": canvas[:2]}
+            )
+        )
+        assert out.sampled_token_ids == [[3, 1]]
+        assert out.logprobs.logprob_token_ids.shape == (2, 3)
+
+        # Past its cap, the read converges at once on what is left.
+        out = _step(rt, "r")
+        assert out.sampled_token_ids == [[3, 1, 4, 1]]
+
+    def test_constrained_read_stays_inside_its_labels(self, runtime) -> None:
+        rt, _ = runtime
+        constrained = _read(diffusion_max_steps=1, diffusion_constrained=True)
+        free = _read(diffusion_max_steps=1)
+        _step(rt, new_reqs=[_new_req("c", constrained), _new_req("f", free)])
+
+        out = _step(rt, "c", "f")
+
+        # Only ids 3 and 4 are allowed: the +-50 logits tie them at -50
+        # wherever the target is neither, and argmax takes the first.
+        assert out.sampled_token_ids == [[3, 3, 4, 3], [3, 1, 4, 1]]
+        c = out.logprobs.slice_request(0, _CANVAS)
+        np.testing.assert_allclose(
+            np.exp(c.logprobs[:, 1:]).sum(axis=1), 1.0, rtol=1e-5
+        )
+        f = out.logprobs.slice_request(1, _CANVAS)
+        np.testing.assert_allclose(f.logprobs[1, 1:], -100.0, rtol=1e-4)
+
     def test_finished_requests_drop_their_canvas(self, runtime) -> None:
         rt, _ = runtime
-        new_req = SimpleNamespace(
-            req_id="r",
-            prompt_token_ids=[1, 2],
-            sampling_params=None,
-            block_ids=([0],),
-            num_computed_tokens=0,
-        )
+        new_req = _new_req("r", prompt=[1, 2])
         rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 2}))
 
         rt.execute_model(_scheduler_output(scheduled={}, finished={"r"}))
 
         assert rt._requests == {}
         assert "r" not in rt._runner._request_states
+
+    def test_readmitted_request_prefills_its_committed_tokens(self, runtime) -> None:
+        rt, forwards = runtime
+        new_req = _new_req("r", prompt=[1, 2], prefill_token_ids=[1, 2, 3, 1])
+
+        rt.execute_model(_scheduler_output(new_reqs=[new_req], scheduled={"r": 4}))
+
+        state = rt._runner._request_states["r"]
+        assert forwards == [(False, [(0, [1, 2, 3, 1])])]
+        assert state.token_ids == [1, 2, 3, 1]
+        assert state.prompt_len == 2
 
 
 class TestEncoderHiddenStates:
@@ -645,7 +840,8 @@ class TestDecoderForwardContext:
         runner.model = SimpleNamespace(model=SimpleNamespace(decoder=decoder))
         rt = DiffusionGemmaRuntime(runner)
         for req_id in ("a", "b"):
-            rt._requests[req_id] = diffusion._DiffusionRequest(phase="denoise")
+            rt._requests[req_id] = rt._new_request(SamplingParams())
+            rt._requests[req_id].phase = "denoise"
         segments = [
             diffusion._Segment("a", [1, 2, 3, 4], 10, [[0]]),
             diffusion._Segment("b", [5, 6, 7, 8], 20, [[1, 2]]),
@@ -750,15 +946,41 @@ class TestPlatformDiffusionConfig:
         [
             {"logprobs": 2},
             {"logprob_token_ids": [1, 2]},
-            {"extra_args": {"diffusion_canvas_length": _CANVAS}},
+            {
+                "logprob_token_ids": [1, 2],
+                "extra_args": {
+                    "diffusion_canvas_length": _CANVAS,
+                    "diffusion_seed_canvas": [1] * _CANVAS,
+                    "diffusion_pinned": [0],
+                    "diffusion_max_steps": 1,
+                    "diffusion_read_only": True,
+                    "diffusion_constrained": True,
+                },
+            },
         ],
     )
-    def test_accepts_sample_logprobs_while_serving_diffusion(
+    def test_accepts_logprobs_and_reads_while_serving_diffusion(
         self, monkeypatch, params
     ) -> None:
         monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
+        monkeypatch.setattr(MetalPlatform, "_diffusion_canvas_length", _CANVAS)
 
         MetalPlatform.validate_request(None, SamplingParams(**params))
+
+    def test_rejects_a_canvas_smaller_than_the_served_one(self, monkeypatch) -> None:
+        from vllm.exceptions import VLLMValidationError
+
+        monkeypatch.setattr(MetalPlatform, "_serves_diffusion", True)
+        # Restored after the test; the config check records the served canvas.
+        monkeypatch.setattr(MetalPlatform, "_diffusion_canvas_length", None)
+        MetalPlatform._check_diffusion_config(_vllm_config())
+        params = SamplingParams(extra_args={"diffusion_canvas_length": _CANVAS - 1})
+
+        with pytest.raises(
+            VLLMValidationError, match="smaller than the served canvas"
+        ) as exc_info:
+            MetalPlatform.validate_request(None, params)
+        assert exc_info.value.parameter == "diffusion_canvas_length"
 
     @pytest.mark.parametrize(
         ("params", "parameter"),
@@ -766,19 +988,9 @@ class TestPlatformDiffusionConfig:
             ({"logprobs": -1}, "logprobs"),
             ({"prompt_logprobs": 1}, "prompt_logprobs"),
             ({"prompt_logprob_token_ids": [1]}, "prompt_logprob_token_ids"),
-            *(
-                ({"extra_args": {name: value}}, name)
-                for name, value in (
-                    ("diffusion_seed_canvas", [1] * _CANVAS),
-                    ("diffusion_pinned", [0]),
-                    ("diffusion_max_steps", 1),
-                    ("diffusion_read_only", True),
-                    ("diffusion_constrained", True),
-                )
-            ),
         ],
     )
-    def test_rejects_what_the_runtime_ignores_while_serving_diffusion(
+    def test_rejects_prompt_and_full_vocab_logprobs_while_serving_diffusion(
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError
@@ -791,9 +1003,14 @@ class TestPlatformDiffusionConfig:
 
     @pytest.mark.parametrize(
         ("params", "parameter"),
-        [({"top_k": 5}, "top_k"), ({"top_p": 0.9}, "top_p")],
+        [
+            ({"top_k": 5}, "top_k"),
+            ({"top_p": 0.9}, "top_p"),
+            ({"logit_bias": {1: 2.0}}, "logit_bias"),
+            ({"min_tokens": 2}, "min_tokens"),
+        ],
     )
-    def test_rejects_top_k_and_top_p_while_serving_diffusion(
+    def test_rejects_canvas_sampling_controls_while_serving_diffusion(
         self, monkeypatch, params, parameter
     ) -> None:
         from vllm.exceptions import VLLMValidationError

@@ -20,7 +20,7 @@ from vllm_metal.attention.impls.bidi_prefill import (
     slot_indices,
 )
 from vllm_metal.metal import get_ops
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 BLOCK = 16
 HEADS, KV_HEADS, HD = 4, 2, 64
@@ -39,8 +39,7 @@ def _setup(seed: int, *, n: int, seq_len: int, num_blocks: int = 128):
 
 
 def _kernel(query, key_cache, value_cache, table, *, n, seq_len, window):
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -53,7 +52,6 @@ def _kernel(query, key_cache, value_cache, table, *, n, seq_len, window):
         BLOCK,
         seq_len,
         window if window is not None else -1,
-        out,
     )
     mx.eval(out)
     return out
@@ -84,8 +82,7 @@ def _kernel_multi(
     query, key_cache, value_cache, table, *, kv_lens, cu_seqlens_q, window
 ):
     """``_kernel`` for a whole batch: per-segment kv lens, query offsets, tables."""
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -98,7 +95,6 @@ def _kernel_multi(
         BLOCK,
         max(kv_lens),
         window if window is not None else -1,
-        out,
     )
     mx.eval(out)
     return out

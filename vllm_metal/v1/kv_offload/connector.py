@@ -8,6 +8,8 @@ the scheduler process loads this module.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
@@ -20,6 +22,9 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_metal.v1.kv_offload.spec import MetalTieringOffloadingSpec
+
+if TYPE_CHECKING:
+    from vllm_metal.v1.kv_offload.worker import MetalKVOffloadWorker
 
 
 def validate_metal_support(kv_cache_config: KVCacheConfig) -> None:
@@ -70,3 +75,25 @@ class MetalOffloadingConnector(OffloadingConnector):
             )
         # Upstream's _init_worker only sets self.worker.
         self.connector_worker.worker = spec.get_metal_worker(kv_caches)
+
+    def release_host_pool(self) -> None:
+        """Free the host pool for sleep mode.
+
+        vLLM resets the connector before it discards the KV cache. That
+        empties the pool's index, so nothing reads the pool until wake.
+        """
+        if (worker := self._metal_worker()) is not None:
+            worker.release_host_pool()
+
+    def restore_host_pool(self) -> None:
+        if (worker := self._metal_worker()) is not None:
+            worker.restore_host_pool()
+
+    def _metal_worker(self) -> MetalKVOffloadWorker | None:
+        # Worker side only, so importing mlx here is fine.
+        from vllm_metal.v1.kv_offload.worker import MetalKVOffloadWorker
+
+        if self.connector_worker is None:
+            return None
+        worker = self.connector_worker.worker
+        return worker if isinstance(worker, MetalKVOffloadWorker) else None

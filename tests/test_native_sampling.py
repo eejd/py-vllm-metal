@@ -7,7 +7,8 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-from vllm_metal.v1.sampling_batch import SamplingBatch
+from tests.stub_runner import make_stub_runner
+from vllm_metal.v1.sampling_batch import SamplingBatch, native_sampling_key
 
 VOCAB_SIZE = 512
 BATCH_SIZE = 4
@@ -101,6 +102,8 @@ class TestNativeRandomEligibility:
                 "allowed token ids",
                 [_random_params(allowed_token_ids=[1, 2])],
             ),
+            ("logit bias", [_random_params(logit_bias={1: 5.0})]),
+            ("min tokens still pending", [_random_params(min_tokens=2)]),
         ],
     )
     def test_ineligible_batches_fall_back(self, label, params_list) -> None:
@@ -111,6 +114,11 @@ class TestNativeRandomEligibility:
         params._bad_words_token_ids = [[99]]
 
         assert not SamplingBatch.params_allow_native_random([params])
+
+    def test_min_tokens_returns_to_native_random_once_reached(self) -> None:
+        params = [_random_params(min_tokens=2), _random_params()]
+        assert not SamplingBatch.params_allow_native_random(params, [1, 0])
+        assert SamplingBatch.params_allow_native_random(params, [2, 0])
 
 
 class TestTopKTopPMaskParity:
@@ -358,3 +366,204 @@ class TestMlxRandomTokens:
 
         for index, expected in enumerate(probs):
             assert abs(counts[index] / draws - expected) < 0.02
+
+
+class TestNativeSamplingKey:
+    @pytest.mark.parametrize(
+        ("seed", "step", "legacy_key_seed"),
+        [
+            (0, 0, 0xCFD8C22A91380BA0),
+            (7, 3, 0x3D1DD505FE98FC2C),
+            (-7, 3, 0xA9DE8C3DA842F403),
+        ],
+    )
+    def test_engine_keys_are_separate_from_legacy_request_keys(
+        self, seed: int, step: int, legacy_key_seed: int
+    ) -> None:
+        """Preserve #1233's request keys without sharing the engine stream."""
+        request_key = native_sampling_key(seed, step)
+        engine_key = native_sampling_key(seed, step, domain="engine")
+        legacy_key = mx.random.key(legacy_key_seed)
+        mx.eval(request_key, engine_key, legacy_key)
+        assert request_key.tolist() == legacy_key.tolist()
+        assert engine_key.tolist() != request_key.tolist()
+
+    @pytest.mark.parametrize("seed", [0, 42, -7])
+    def test_engine_seed_and_step_reproduce_keys_and_tokens(self, seed: int) -> None:
+        runner = make_stub_runner(
+            _native_sampling_enabled=True, _native_sampling_step=11
+        )
+        runner.model_config.seed = seed
+        key = runner._next_native_sample_key()
+        same_key = native_sampling_key(seed, 11, domain="engine")
+        next_key = runner._next_native_sample_key()
+        logits = mx.zeros((8, VOCAB_SIZE))
+        params = [_random_params(temperature=0.8, top_k=0, top_p=1.0)] * 8
+        tokens = [
+            SamplingBatch.native_sample_tokens(
+                logits,
+                params,
+                vocab_size=VOCAB_SIZE,
+                next_native_rng_key=lambda k=k: k,
+                output_lengths=[0] * len(params),
+            )
+            for k in (key, same_key, next_key)
+        ]
+        mx.eval(key, same_key, next_key, *tokens)
+        assert key.tolist() == same_key.tolist()
+        assert key.tolist() != next_key.tolist()
+        assert tokens[0].tolist() == tokens[1].tolist()
+        assert tokens[0].tolist() != tokens[2].tolist()
+
+    @pytest.mark.parametrize("seeds", [(0, 42), (0, 0), (42, 42)])
+    def test_runner_keys_respect_engine_seed(self, seeds: tuple[int, int]) -> None:
+        keys = []
+        for seed in seeds:
+            runner = make_stub_runner(
+                _native_sampling_enabled=True, _native_sampling_step=11
+            )
+            runner.model_config.seed = seed
+            keys.append(runner._next_native_sample_key())
+        mx.eval(*keys)
+        assert (keys[0].tolist() == keys[1].tolist()) == (seeds[0] == seeds[1])
+
+
+class TestSeededNativeSampling:
+    """Seeded requests draw from a seed-derived per-request MLX key."""
+
+    @staticmethod
+    def _sample(
+        logits: mx.array,
+        params: list[SamplingParams],
+        output_lengths: list[int],
+        engine_seed: int = 0,
+    ) -> list[int]:
+        key = mx.random.key(engine_seed)
+        tokens = SamplingBatch.native_sample_tokens(
+            logits,
+            params,
+            vocab_size=VOCAB_SIZE,
+            next_native_rng_key=lambda: key,
+            output_lengths=output_lengths,
+            allow_seed=True,
+        )
+        mx.eval(tokens)
+        return tokens.tolist()
+
+    @pytest.mark.parametrize(
+        ("params", "steps_per_call"),
+        [
+            ([_random_params(seed=1), _random_params(seed=2)], 0),
+            ([_random_params(seed=1), _random_params(temperature=0.0)], 0),
+            ([_random_params(seed=1), _random_params()], 1),
+        ],
+        ids=["all-seeded", "seeded-plus-greedy", "seeded-plus-unseeded"],
+    )
+    def test_engine_counter_advances_only_for_unseeded_random_rows(
+        self, params: list[SamplingParams], steps_per_call: int
+    ) -> None:
+        logits = mx.random.normal((len(params), VOCAB_SIZE), key=mx.random.key(3))
+        runner = make_stub_runner(_native_sampling_enabled=True)
+        steps = 4
+        for n in range(steps):
+            tokens = SamplingBatch.native_sample_tokens(
+                logits,
+                params,
+                vocab_size=VOCAB_SIZE,
+                next_native_rng_key=runner._next_native_sample_key,
+                output_lengths=[n] * len(params),
+                allow_seed=True,
+            )
+            mx.eval(tokens)
+        assert runner._native_sampling_step == steps_per_call * steps
+
+    def test_seeded_rows_are_eligible_only_with_allow_seed(self) -> None:
+        params = [_random_params(seed=7), _random_params()]
+        assert not SamplingBatch.params_allow_native_random(params)
+        assert SamplingBatch.params_allow_native_random(params, allow_seed=True)
+
+    def test_row_key_is_pure_and_position_dependent(self) -> None:
+        a = native_sampling_key(7, 3)
+        b = native_sampling_key(7, 3)
+        mx.eval(a, b)
+        assert a.tolist() == b.tolist()
+        others = [
+            native_sampling_key(7, 4),
+            native_sampling_key(8, 3),
+            native_sampling_key(-7, 3),
+        ]
+        mx.eval(*others)
+        assert all(o.tolist() != a.tolist() for o in others)
+
+    def test_same_seed_reproduces_tokens(self) -> None:
+        logits = mx.random.normal((1, VOCAB_SIZE), key=mx.random.key(5))
+        params = [_random_params(temperature=1.5, top_k=0, top_p=1.0, seed=42)]
+        runs = [
+            [self._sample(logits, params, [n], engine_seed=e)[0] for n in range(32)]
+            for e in (0, 1)
+        ]
+        assert runs[0] == runs[1]
+        assert len(set(runs[0])) > 1
+
+    def test_different_seeds_differ(self) -> None:
+        logits = mx.random.normal((1, VOCAB_SIZE), key=mx.random.key(5))
+
+        def stream(seed: int) -> list[int]:
+            params = [_random_params(temperature=1.5, top_k=0, top_p=1.0, seed=seed)]
+            return [self._sample(logits, params, [n])[0] for n in range(32)]
+
+        assert stream(1) != stream(2)
+
+    def test_seeded_row_independent_of_batch_neighbors(self) -> None:
+        logits = mx.random.normal((4, VOCAB_SIZE), key=mx.random.key(9))
+        mx.eval(logits)
+        seeded = _random_params(temperature=1.2, top_k=50, top_p=0.9, seed=123)
+        alone = self._sample(logits[2:3], [seeded], [5])[0]
+        neighbors = [
+            _random_params(temperature=0.0),
+            _random_params(temperature=0.9, min_p=0.05),
+            seeded,
+            _random_params(temperature=1.0, seed=999),
+        ]
+        for engine_seed in range(4):
+            mixed = self._sample(logits, neighbors, [0, 3, 5, 1], engine_seed)
+            assert mixed[2] == alone
+            assert mixed[0] == int(mx.argmax(logits[0]).item())
+
+    def test_seeded_draws_respect_candidate_set(self) -> None:
+        logits = mx.random.normal((1, VOCAB_SIZE), key=mx.random.key(13))
+        mx.eval(logits)
+        top = {int(i) for i in mx.argsort(logits[0])[::-1][:4].tolist()}
+        params = [_random_params(temperature=2.0, top_k=4, top_p=1.0, seed=3)]
+        drawn = {self._sample(logits, params, [n])[0] for n in range(64)}
+        assert drawn <= top and len(drawn) > 1
+
+    def test_unseeded_rows_unchanged_by_seeded_neighbor(self) -> None:
+        """Unseeded rows keep the shared batched draw, bitwise."""
+        logits = mx.random.normal((3, VOCAB_SIZE), key=mx.random.key(17))
+        mx.eval(logits)
+        plain = [_random_params(temperature=1.0, top_k=0, top_p=1.0)] * 3
+        with_seed = [plain[0], _random_params(seed=5), plain[2]]
+        key = mx.random.key(77)
+        base = SamplingBatch._native_random_tokens(logits, plain, key)
+        mixed = SamplingBatch.native_sample_tokens(
+            logits,
+            with_seed,
+            vocab_size=VOCAB_SIZE,
+            next_native_rng_key=lambda: key,
+            output_lengths=[0, 0, 0],
+            allow_seed=True,
+        )
+        mx.eval(base, mixed)
+        assert [base.tolist()[i] for i in (0, 2)] == [mixed.tolist()[i] for i in (0, 2)]
+
+    def test_deferred_call_without_allow_seed_rejects_seeded_rows(self) -> None:
+        logits = mx.zeros((1, VOCAB_SIZE))
+        with pytest.raises(RuntimeError, match="gate desync"):
+            SamplingBatch.native_sample_tokens(
+                logits,
+                [_random_params(seed=1)],
+                vocab_size=VOCAB_SIZE,
+                next_native_rng_key=lambda: mx.random.key(0),
+                output_lengths=[0],
+            )

@@ -66,15 +66,14 @@ def _run(
     num_kv_heads: int,
     tables: list[list[int]],
     seq_lens: list[int],
-    cu_seqlens: list[int],
+    cu_seqlens: list[int] | mx.array,
     max_kv: int,
     window_seqlen_q: int,
     sliding_window: int,
     head_size: int = HEAD_SIZE,
     block_size: int = BLOCK_SIZE,
 ) -> mx.array:
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -87,7 +86,6 @@ def _run(
         block_size,
         max_kv,
         sliding_window,
-        out,
         window_seqlen_q=window_seqlen_q,
     )
     mx.eval(out)
@@ -405,6 +403,28 @@ def test_window_hint_contract_rejected(
         )
 
 
+def test_window_hint_evaluates_lazy_loaded_metadata(tmp_path) -> None:
+    """NPZ-backed cumulative lengths can be validated before attention runs."""
+    mx.random.seed(16)
+    query = mx.random.normal((4, 16, HEAD_SIZE)).astype(mx.float16)
+    args = (
+        query,
+        _cache(4, 8, mx.float16),
+        _cache(4, 8, mx.float16),
+        8,
+        [[0, 1, 2, 3]],
+        [54],
+    )
+    kwargs = {"max_kv": 54, "window_seqlen_q": 4, "sliding_window": -1}
+    expected = _run(*args, [0, 4], **kwargs)
+
+    path = tmp_path / "metadata.npz"
+    mx.savez(str(path), cu=mx.array([0, 4], dtype=mx.int32))
+    loaded_cu = mx.load(str(path))["cu"]
+    actual = _run(*args, loaded_cu, **kwargs)
+    assert mx.array_equal(actual, expected)
+
+
 def test_window_hint_rejects_non_int32_cu() -> None:
     """Window-mode validation reads cu_seqlens_q host-side as int32; any
     other dtype is rejected before the bytes could be reinterpreted."""
@@ -414,7 +434,6 @@ def test_window_hint_rejects_non_int32_cu() -> None:
     value_cache = _cache(4, 8, mx.float16)
     query = mx.random.normal(shape=(window, 16, HEAD_SIZE)).astype(mx.float16)
     mx.eval(key_cache, value_cache, query)
-    out = mx.array(0)
     with pytest.raises(
         ValueError, match="cu_seqlens_q must be int32 for window-mode validation"
     ):
@@ -431,7 +450,6 @@ def test_window_hint_rejects_non_int32_cu() -> None:
             BLOCK_SIZE,
             50 + window,
             -1,
-            out,
             window_seqlen_q=window,
         )
 
@@ -557,8 +575,7 @@ def test_windowed_matches_expanded_turboquant(quant: str, window: int) -> None:
     blocks = list(range(nblocks))
 
     def run_tq(tables, seq_lens, cu, wq):
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             query,
             kc,
             vc,
@@ -571,7 +588,6 @@ def test_windowed_matches_expanded_turboquant(quant: str, window: int) -> None:
             BLOCK_SIZE,
             total_len,
             -1,
-            out,
             key_scale_cache=ks,
             value_scale_cache=vs,
             key_zero_cache=kz,

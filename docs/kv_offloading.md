@@ -52,6 +52,9 @@ pool set with `--kv-offloading-size` that is larger than the budget fails at
 startup, after the weights load, with the breakdown and the fix. 8 GiB was
 enough for the Qwen3-32B benchmark in #737.
 
+The pool takes memory only as chunks are stored. Level 1 sleep frees it (see
+[Sleep mode](configuration.md#sleep-mode)).
+
 ## Limits
 
 Only uniform full-attention models are supported (GQA, MHA, MQA), for example
@@ -63,6 +66,8 @@ Qwen3 dense models. Refused at startup:
 - Pooling and speech-to-text models.
 - Pipeline and data parallelism, and any executor other than `uni`.
 - `--kv-offloading-size` combined with a different KV connector.
+- `canonical_layout` in `kv_connector_extra_config`. Metal does not write the
+  canonical layout.
 
 ## Reuse across restarts
 

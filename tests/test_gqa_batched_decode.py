@@ -117,7 +117,6 @@ def test_generic_admission_counts_static_reducer_memory(
             block,
             maximum,
             lengths,
-            preplanned=False,
             gqa_disabled=disabled,
             max_decode_context_len=length,
         )
@@ -317,21 +316,26 @@ def test_batch_planner_rejects_unshipped_geometry(geometry):
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition, dtype):
     # Disjoint shuffled pages and different tail widths expose row/stride errors.
-    out, ref = _run_primitive(
-        [1, partition - 1, partition + 1, 3 * partition + 3],
-        dtype,
-        interleaved=True,
-        seed=1004,
-        num_query_heads=q,
-        num_kv_heads=kv,
-        head_size=head,
-        block_size=block,
-        test_partition=partition,
-    )
+    lengths = [1, partition - 1, partition + 1, 3 * partition + 3]
+    kwargs = {
+        "interleaved": True,
+        "seed": 1004,
+        "num_query_heads": q,
+        "num_kv_heads": kv,
+        "head_size": head,
+        "block_size": block,
+        "test_partition": partition,
+    }
+    rectangular, _ = _run_primitive(lengths, dtype, **kwargs)
+    out, ref = _run_primitive(lengths, dtype, gqa_lengths=lengths, **kwargs)
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == partition
     assert get_ops().last_gqa_num_requests() == 4
     _assert_close(out, ref, dtype)
+    np.testing.assert_array_equal(
+        np.array(out.astype(mx.float32)),
+        np.array(rectangular.astype(mx.float32)),
+    )
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
@@ -351,7 +355,7 @@ def test_automatic_batch_route_matches_reference(q, kv, head, block, partition):
         block_size=block,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=lengths,
+        gqa_lengths=lengths,
     )
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == partition
@@ -377,7 +381,7 @@ def test_batch_gate_keeps_excluded_routes(kwargs):
     routing = {
         "num_decode_requests": 2,
         "num_decode_tokens": 2,
-        "gqa_context_lens": lengths,
+        "gqa_lengths": lengths,
     }
     routing.update(kwargs)
     out, ref = _run_primitive(
@@ -400,7 +404,7 @@ def test_batch_uses_known_core_budget_without_unsplit_grid_veto(
         seed=1007,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=lengths,
+        gqa_lengths=lengths,
     )
     if expected_partition:
         assert _dispatch_family() == "gqa_decode"
@@ -424,7 +428,7 @@ def test_production_dispatch_above_legacy_split_budget(dtype):
         head_size=128,
         num_decode_requests=len(lengths),
         num_decode_tokens=len(lengths),
-        gqa_context_lens=lengths,
+        gqa_lengths=lengths,
     )
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == 512
@@ -434,7 +438,7 @@ def test_production_dispatch_above_legacy_split_budget(dtype):
 
 @pytest.mark.parametrize("lengths", [[1], [0, 1024], [-1, 1024], [1024, 1025]])
 def test_invalid_host_lengths_fail_before_dispatch(lengths):
-    with pytest.raises(ValueError, match="gqa_context_lens"):
+    with pytest.raises(ValueError, match="gqa_length_plan"):
         _run_primitive(
             [1024, 1024],
             mx.float16,
@@ -442,12 +446,11 @@ def test_invalid_host_lengths_fail_before_dispatch(lengths):
             seed=1008,
             num_decode_requests=2,
             num_decode_tokens=2,
-            gqa_context_lens=lengths,
+            gqa_lengths=lengths,
         )
 
 
-@pytest.mark.parametrize("preplanned", [False, True])
-def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
+def test_host_lengths_are_captured_by_each_lazy_primitive():
     ops = get_ops()
     q = mx.ones((2, 32, 128), mx.float16)
     k = mx.ones((1344, 16, 8, 128), mx.float16)
@@ -456,13 +459,8 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
     lengths = mx.array([10752, 10752], mx.int32)
     cu = mx.array([0, 1, 2], mx.int32)
     host_lengths = [10752, 10752]
-    routing = (
-        {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
-        if preplanned
-        else {"gqa_context_lens": host_lengths}
-    )
-    selected, fallback = mx.array(0), mx.array(0)
-    ops.paged_attention_primitive(
+    routing = {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
+    selected = ops.paged_attention_primitive(
         q,
         k,
         v,
@@ -475,7 +473,6 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
         16,
         10752,
         -1,
-        selected,
         num_decode_requests=2,
         num_decode_tokens=2,
         **routing,
@@ -483,7 +480,7 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
     # Neither caller-side mutation nor destruction may change the saved plan.
     del routing
     host_lengths.clear()
-    ops.paged_attention_primitive(
+    fallback = ops.paged_attention_primitive(
         q,
         k,
         v,
@@ -496,10 +493,8 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
         16,
         10752,
         -1,
-        fallback,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=host_lengths,
     )
     mx.eval(fallback)
     _assert_fallback()
@@ -512,7 +507,8 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
-    "q,kv,head,cache_block", [(24, 4, 256, 784), (16, 2, 256, 1056)]
+    "q,kv,head,cache_block",
+    [(24, 4, 256, 784), (24, 4, 256, 800), (16, 2, 256, 1056)],
 )
 def test_batched_shared_prefix_and_strided_scheduler_pages(
     dtype, partition, q, kv, head, cache_block
@@ -552,9 +548,10 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         mx.array(slots, mx.int64),
     )
     tables, block = build_block_tables(pages, cache_block)
+    if cache_block in (800, 1056):
+        assert block == 32
     query = mx.ones((2, q, head), dtype)
-    out = mx.array(0)
-    ops._gqa_paged_attention_for_test(
+    out = ops._gqa_paged_attention_for_test(
         query,
         key,
         value,
@@ -564,7 +561,6 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         block,
         length,
         partition,
-        out,
     )
     mx.eval(out)  # No evaluation boundary between scatter and attention.
     ref = _grouped_paged_reference(
@@ -592,8 +588,23 @@ def test_recorded_batch_size_clears_with_diagnostics():
     assert ops.last_gqa_num_requests() == 0
 
 
-@pytest.mark.parametrize("dtype,turboquant", [(mx.float32, False), (mx.float16, True)])
-def test_unsupported_batch_cache_retains_fallback(dtype, turboquant):
+def test_float32_batch_uses_fallback():
+    lengths = [10752, 11009]
+    out, ref = _run_primitive(
+        lengths,
+        mx.float32,
+        interleaved=True,
+        seed=1011,
+        num_decode_requests=2,
+        num_decode_tokens=2,
+        gqa_lengths=lengths,
+    )
+    _assert_fallback()
+    _assert_close(out, ref, mx.float32)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_turboquant_batch_uses_p256_gqa_decode(dtype):
     lengths = [10752, 11009]
     out, ref = _run_primitive(
         lengths,
@@ -602,22 +613,30 @@ def test_unsupported_batch_cache_retains_fallback(dtype, turboquant):
         seed=1011,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=lengths,
-        turboquant=turboquant,
+        gqa_lengths=lengths,
+        turboquant=True,
     )
-    _assert_fallback()
+    ops = get_ops()
+    assert _dispatch_family() == "gqa_decode"
+    assert ops.last_gqa_partition_size() == 256
+    assert ops.last_gqa_num_requests() == 2
     _assert_close(out, ref, dtype)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_ragged_scratch_budget_falls_back_before_allocation(dtype):
+def test_compact_scratch_admits_ragged_batch_within_budget(dtype):
     ops = get_ops()
     batch, q, kv, head, block = 256, 24, 4, 256, 16
     lengths = [131072] + [1] * (batch - 1)
     padded_bytes = batch * q * 256 * (2 * head + 8)
     assert padded_bytes == 780 * 1024**2
     assert ops._gqa_decode_config_for_test()["max_scratch_bytes"] == 512 * 1024**2
-    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 0
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 512
+    # A uniform batch still exceeds the budget: compaction cannot save its slots.
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, [131072] * batch, 40) == 0
+    assert (
+        ops.gqa_decode_batch_partition_size(q, kv, head, [1] + [131072] * 255, 40) == 0
+    )
     query = mx.zeros((batch, q, head), dtype)
     keys = mx.zeros((1, block, kv, head), dtype)
     values = mx.full(keys.shape, 2, dtype)
@@ -638,9 +657,9 @@ def test_ragged_scratch_budget_falls_back_before_allocation(dtype):
         lengths,
     )
     mx.eval(out)
-    assert ops.last_paged_dispatch() == "per_token_ps0"
-    assert ops.last_gqa_partition_size() == 0
-    assert mx.get_peak_memory() - before < 64 * 1024**2
+    assert ops.last_paged_dispatch() == "gqa_decode"
+    assert ops.last_gqa_partition_size() == 512
+    assert mx.get_peak_memory() - before < 16 * 1024**2
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3)
 
 
@@ -666,6 +685,5 @@ def test_precomputed_length_plan_is_immutable_and_validated():
             16,
             10752,
             -1,
-            mx.array(0),
             gqa_length_plan=plan,
         )

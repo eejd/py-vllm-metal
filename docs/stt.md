@@ -2,32 +2,6 @@
 
 vllm-metal supports OpenAI-compatible Speech-to-Text using Whisper and Qwen3-ASR models, running natively on Apple Silicon via MLX.
 
-## Installation
-
-First, install vllm-metal using the install script (see [Installation](installation.md)):
-
-```bash
-./install.sh
-```
-
-Then install the optional STT dependencies inside the virtual environment:
-
-```bash
-source .venv-vllm-metal/bin/activate
-pip install 'vllm-metal[stt]'
-```
-
-### ffmpeg (Optional)
-
-ffmpeg is only needed for non-WAV audio formats (mp3, m4a, flac, etc.):
-
-```bash
-# macOS
-brew install ffmpeg
-
-# Not required for WAV files - librosa handles those directly
-```
-
 ## Quick Start
 
 ```bash
@@ -38,6 +12,8 @@ vllm serve openai/whisper-small --port 8000
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@recording.wav"
 ```
+
+Some audio formats require FFmpeg (`brew install ffmpeg`).
 
 ## Supported Models
 
@@ -84,8 +60,8 @@ Transcribe audio to text.
 | `repetition_penalty` | float | `1.0` | Penalize tokens already in the prompt or the transcript |
 | `frequency_penalty` / `presence_penalty` | float | `0.0` | Penalize tokens already in the transcript |
 
-`max_completion_tokens` caps the transcript. `logit_bias` and `min_tokens` are
-rejected for every vllm-metal request.
+`max_completion_tokens` caps the transcript. Transcription requests do not
+carry `logit_bias` or `min_tokens`.
 
 ### `POST /v1/audio/translations`
 
