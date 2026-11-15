@@ -12,6 +12,9 @@ from typing import ClassVar, Literal
 import mlx.core as mx
 import numpy as np
 import torch
+from torch._dynamo.exc import BackendCompilerFailed
+from torch._inductor.exc import CppCompileError
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -30,6 +33,36 @@ from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
+logger = init_logger(__name__)
+
+
+class MetalSampler(Sampler):
+    """Retry only logprob gathering, not sampling, when compilation fails."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._logprobs_eager = False
+
+    def _gather_with_fallback(self, gather, *args, **kwargs):
+        if not self._logprobs_eager:
+            try:
+                return gather(*args, **kwargs)
+            except (BackendCompilerFailed, CppCompileError) as exc:
+                self._logprobs_eager = True
+                logger.warning(
+                    "Sampler logprob compilation failed; falling back to eager: %s",
+                    exc,
+                )
+        with torch.compiler.set_stance("force_eager"):
+            return gather(*args, **kwargs)
+
+    def gather_logprobs(self, *args, **kwargs):
+        return self._gather_with_fallback(super().gather_logprobs, *args, **kwargs)
+
+    def gather_specific_token_logprobs(self, *args, **kwargs):
+        return self._gather_with_fallback(
+            super().gather_specific_token_logprobs, *args, **kwargs
+        )
 
 
 @dataclass(frozen=True)

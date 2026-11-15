@@ -7,6 +7,11 @@ Both the MLX and experimental PyTorch MPS backends default to Model Runner V2
 vLLM's V2 configuration and scheduler contract. An explicit environment value
 is preserved; set `VLLM_USE_V2_MODEL_RUNNER=0` to opt out on MLX. MPS requires V2.
 
+When the MLX runner's CPU sampler cannot compile its logprob rank helper
+(for example, because the C++ compiler cannot find OpenMP headers), it logs a
+warning and uses eager logprob gathering for the rest of that sampler's lifetime.
+Sampling is not repeated; unrelated runtime errors still propagate.
+
 ## Environment Variables
 
 vllm-metal validates these variables when the engine configuration is created and reports every invalid value together, so a typo fails the startup. Boolean switches treat `1` as on and any other value as off.
